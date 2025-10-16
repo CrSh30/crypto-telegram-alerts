@@ -11,7 +11,7 @@ COINS = {
     "ETH": ("ETH-USDT", "ETH-USDT", "ETHUSDT", None),
     "BNB": ("BNB-USDT", "BNB-USDT", "BNBUSDT", None),
     "SOL": ("SOL-USDT", "SOL-USDT", "SOLUSDT", None),
-    "BGB": (None,       None,       None,       "BGBUSDT"),  # Bitget only
+    "BGB": (None, None, None, "BGBUSDT_SPBL"),  # Spot Bitget usa suffisso _SPBL
 }
 TF = "1h"          # timeframe logico
 CANDLES = 200      # numero di barre da scaricare

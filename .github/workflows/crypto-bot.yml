@@ -2,24 +2,27 @@ name: Crypto RSI/MACD Bot
 
 on:
   schedule:
-    - cron: "*/10 * * * *"   # ogni 10 minuti
-  workflow_dispatch:         # per avvio manuale
+    - cron: "*/10 * * * *"
+  workflow_dispatch:
 
 jobs:
   run-bot:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+
       - name: Install dependencies
         run: |
-          python -m pip install --upgrade pip
-          pip install "requests==2.32.3" "pandas==2.2.2" "pandas-ta==0.3.14b0"
+          python -m pip install --upgrade pip setuptools wheel
+          pip install "requests==2.32.3" "pandas==2.2.3" "pandas-ta==0.4.71b0"
+
       - name: Run bot
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          TELEGRAM_CHAT_ID:  ${{ secrets.TELEGRAM_CHAT_ID }}
         run: python bot.py

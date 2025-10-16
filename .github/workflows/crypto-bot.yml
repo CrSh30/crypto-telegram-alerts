@@ -2,7 +2,7 @@ name: Crypto RSI/MACD Bot
 
 on:
   schedule:
-    - cron: "0 * * * *"   # ogni ora, al minuto 00
+    - cron: "0 * * * *"   # ogni ora
   workflow_dispatch:
 
 jobs:
@@ -11,12 +11,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # Ripristina lo stato (.state/last_signals.json) da cache
+      # 1) Ripristina la cache dello stato (cooldown/daily report)
       - name: Restore state cache
         uses: actions/cache/restore@v4
         with:
           path: .state
-          key: bot-state
+          key: bot-state-
+          restore-keys: |
+            bot-state-
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -37,11 +39,10 @@ jobs:
           TELEGRAM_CHAT_ID:  ${{ secrets.TELEGRAM_CHAT_ID }}
         run: python bot.py
 
-      # Salva/aggiorna la cache con l'ultimo stato (cooldown)
-      - name: Restore state cache
-        uses: actions/cache/restore@v4
+      # 2) Salva la cache aggiornando lo stato (chiave dinamica per evitare conflitti)
+      - name: Save state cache
+        if: always()
+        uses: actions/cache/save@v4
         with:
           path: .state
-          key: bot-state-
-          restore-keys: |
-            bot-state-
+          key: bot-state-${{ github.run_id }}

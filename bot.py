@@ -247,6 +247,7 @@ def check_macd(row, prev):
             msgs.append(("macd_dn",  f"MACD bearish cross — {row['macd']:.4f} < {row['macd_signal']:.4f}"))
     return msgs
 
+send_telegram("✅ Test: il bot ha eseguito correttamente e può inviare messaggi.")
 def run_once():
     all_msgs = []
     for sym in COINS.keys():

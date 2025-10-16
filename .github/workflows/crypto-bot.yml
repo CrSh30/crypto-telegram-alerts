@@ -2,7 +2,7 @@ name: Crypto RSI/MACD Bot
 
 on:
   schedule:
-    - cron: "0 * * * *"   # ogni ora
+    - cron: "0 * * * *"   # esegue il bot ogni ora
   workflow_dispatch:
 
 jobs:
@@ -11,7 +11,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # 1) Ripristina la cache dello stato (cooldown/daily report)
+      # 1️⃣ Ripristina la cache dello stato (cooldown/daily report)
       - name: Restore state cache
         uses: actions/cache/restore@v4
         with:
@@ -19,6 +19,21 @@ jobs:
           key: bot-state-
           restore-keys: |
             bot-state-
+
+      # 🔍 Controllo iniziale: verifica se la cache è stata ripristinata
+      - name: Verify restored state (before bot run)
+        run: |
+          echo "🧩 Verifica cache ripristinata..."
+          if [ -f .state/last_signals.json ]; then
+            echo "✅ File di stato trovato (cache ripristinata correttamente)"
+            echo "📦 Dimensione: $(wc -c < .state/last_signals.json) bytes"
+            echo "🕒 Ultima modifica:"
+            stat -c "%y" .state/last_signals.json || echo "stat non disponibile"
+            echo "📖 Contenuto parziale:"
+            head -n 10 .state/last_signals.json
+          else
+            echo "⚠️ Nessun file di stato trovato (probabile prima esecuzione o cache vuota)"
+          fi
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -39,10 +54,38 @@ jobs:
           TELEGRAM_CHAT_ID:  ${{ secrets.TELEGRAM_CHAT_ID }}
         run: python bot.py
 
-      # 2) Salva la cache aggiornando lo stato (chiave dinamica per evitare conflitti)
+      # 🔍 Controllo intermedio: mostra file di stato generato/aggiornato
+      - name: Show state file (debug)
+        run: |
+          if [ -f .state/last_signals.json ]; then
+            echo "STATE SIZE:"
+            wc -c .state/last_signals.json
+            echo "STATE CONTENT (prime righe):"
+            head -n 15 .state/last_signals.json
+          else
+            echo "⚠️ Nessun file di stato trovato dopo l'esecuzione del bot!"
+          fi
+
+      # 2️⃣ Salva la cache aggiornata (chiave dinamica per evitare conflitti)
       - name: Save state cache
         if: always()
         uses: actions/cache/save@v4
         with:
           path: .state
           key: bot-state-${{ github.run_id }}
+
+      # 3️⃣ Verifica che la cache sia stata effettivamente salvata
+      - name: Verify saved state (after cache save)
+        if: always()
+        run: |
+          echo "🧩 Verifica cache salvata..."
+          if [ -f .state/last_signals.json ]; then
+            echo "✅ File di stato trovato e salvato!"
+            echo "📦 Dimensione: $(wc -c < .state/last_signals.json) bytes"
+            echo "🕒 Ultima modifica:"
+            stat -c "%y" .state/last_signals.json || echo "stat non disponibile"
+            echo "📖 Contenuto parziale:"
+            head -n 15 .state/last_signals.json || echo "(file vuoto o binario)"
+          else
+            echo "⚠️ Nessun file .state/last_signals.json trovato al momento del salvataggio!"
+          fi

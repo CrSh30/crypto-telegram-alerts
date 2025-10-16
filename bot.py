@@ -307,6 +307,20 @@ def should_send_daily_report(state: dict) -> bool:
 def mark_daily_report_sent(state: dict):
     state["_daily_report_date"] = str(today_in_rome())
 
+def should_send_heartbeat(state: dict) -> bool:
+    """
+    Invia l'heartbeat una sola volta al giorno nella finestra 08:00–08:05 Europe/Rome.
+    (Il workflow gira all'ora spaccata; usiamo la stessa finestra del daily.)
+    """
+    now_it = datetime.now(ZoneInfo("Europe/Rome"))
+    if not (now_it.hour == 8 and now_it.minute < 5):
+        return False
+    last = state.get("_heartbeat_date")
+    return str(today_in_rome()) != str(last)
+
+def mark_heartbeat_sent(state: dict):
+    state["_heartbeat_date"] = str(today_in_rome())
+
 
 def build_daily_trend_report() -> str:
     lines = []
@@ -317,14 +331,18 @@ def build_daily_trend_report() -> str:
             if rowD is None:
                 lines.append(f"{sym} ?")
                 continue
+
+            arrow = "?"
+            strength = ""
             if notna_all(rowD["macd"], rowD["macd_signal"]):
-                if abs(rowD["macd"] - rowD["macd_signal"]) < 1e-12:
+                delta = rowD["macd"] - rowD["macd_signal"]   # forza: distanza MACD–Signal
+                if abs(delta) < 1e-12:
                     arrow = "→"
                 else:
-                    arrow = "↑" if rowD["macd"] > rowD["macd_signal"] else "↓"
-            else:
-                arrow = "?"
-            lines.append(f"{sym} {arrow}")
+                    arrow = "↑" if delta > 0 else "↓"
+                strength = f" ({delta:+.4f})"  # es. +0.0025 o -0.0017
+
+            lines.append(f"{sym} {arrow}{strength}")
         except Exception:
             lines.append(f"{sym} ?")
     return " ".join(lines)
@@ -382,6 +400,14 @@ def run_once():
             mark_daily_report_sent(state)
     except Exception as e:
         print("Daily report error:", e)
+
+    # Heartbeat giornaliero nella stessa finestra del daily (08:00–08:05 Europe/Rome)
+    try:
+        if should_send_heartbeat(state):
+            send_telegram("✅ Heartbeat: bot attivo e sincronizzato")
+            mark_heartbeat_sent(state)
+    except Exception as e:
+        print("Heartbeat error:", e)
 
     # Salva stato
     save_state(state)

@@ -208,10 +208,10 @@ def fetch_ohlc(symbol_key: str) -> pd.DataFrame:
             return fetch_bybit(by_id, limit=CANDLES, interval="60")
         except Exception as e:
             print(symbol_key, "Bybit fail:", e)
-    # 4) Bitget (solo per BGB, ma lasciamo fallback)
+    # 4) Bitget (BGB)
     if bg_id:
         try:
-            return fetch_bitget(bg_id, limit=CANDLES, granularity="60")
+            return fetch_bitget(bg_id, limit=CANDLES)   # <-- niente 'granularity'
         except Exception as e:
             print(symbol_key, "Bitget fail:", e)
     raise RuntimeError("Nessuna fonte disponibile")

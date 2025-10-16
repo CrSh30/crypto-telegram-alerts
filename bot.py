@@ -98,22 +98,76 @@ def fetch_bybit(symbol: str, limit=200, interval="60") -> pd.DataFrame:
     return df
 
 def fetch_bitget(symbol: str, limit=200, granularity="60"):
-    # Bitget v2 market/candles (spot): [ts, o, h, l, c, vol, quoteVol]
-    url = "https://api.bitget.com/api/v2/market/candles"
-    params = {"symbol": symbol, "granularity": granularity, "limit": str(limit)}
-    r = requests.get(url, params=params, timeout=25)
-    r.raise_for_status()
-    data = r.json().get("data", [])
-    if not data:
-        raise RuntimeError("Bitget: no data")
-    rows = []
-    for row in data:
-        ts = int(row[0])
-        o, h, l, c, v = float(row[1]), float(row[2]), float(row[3]), float(row[4]), float(row[5])
-        rows.append({"close_time": pd.to_datetime(ts, unit="ms", utc=True), "open": o, "high": h, "low": l, "close": c, "volume": v})
-    df = pd.DataFrame(rows)
-    df.sort_values("close_time", inplace=True)
-    return df
+    """
+    Bitget spot:
+    - Nuovo endpoint v2:  /api/v2/market/candles   (granularity es. '1h' o '60')
+      In alcuni ambienti accetta minuti ('60'), in altri stringhe ('1h').
+    - Legacy v1 spot:     /api/spot/v1/market/candles (period es. '1H')
+    """
+    # 1) v2, granularity '1h'
+    try:
+        url = "https://api.bitget.com/api/v2/market/candles"
+        params = {"symbol": symbol, "granularity": "1h", "limit": str(limit)}
+        r = requests.get(url, params=params, timeout=25)
+        r.raise_for_status()
+        data = r.json().get("data", [])
+        if data:
+            rows = []
+            for row in data:
+                ts = int(row[0])
+                o, h, l, c, v = float(row[1]), float(row[2]), float(row[3]), float(row[4]), float(row[5])
+                rows.append({
+                    "close_time": pd.to_datetime(ts, unit="ms", utc=True),
+                    "open": o, "high": h, "low": l, "close": c, "volume": v
+                })
+            df = pd.DataFrame(rows).sort_values("close_time")
+            return df
+    except Exception as e:
+        print("Bitget v2 (1h) fail:", e)
+
+    # 2) v2, granularity '60' (minuti)
+    try:
+        url = "https://api.bitget.com/api/v2/market/candles"
+        params = {"symbol": symbol, "granularity": "60", "limit": str(limit)}
+        r = requests.get(url, params=params, timeout=25)
+        r.raise_for_status()
+        data = r.json().get("data", [])
+        if data:
+            rows = []
+            for row in data:
+                ts = int(row[0])
+                o, h, l, c, v = float(row[1]), float(row[2]), float(row[3]), float(row[4]), float(row[5])
+                rows.append({
+                    "close_time": pd.to_datetime(ts, unit="ms", utc=True),
+                    "open": o, "high": h, "low": l, "close": c, "volume": v
+                })
+            df = pd.DataFrame(rows).sort_values("close_time")
+            return df
+    except Exception as e:
+        print("Bitget v2 (60) fail:", e)
+
+    # 3) v1 legacy, period '1H'
+    try:
+        url = "https://api.bitget.com/api/spot/v1/market/candles"
+        params = {"symbol": symbol, "period": "1H", "limit": str(limit)}
+        r = requests.get(url, params=params, timeout=25)
+        r.raise_for_status()
+        data = r.json().get("data", [])
+        if data:
+            rows = []
+            for row in data:
+                ts = int(row[0])
+                o, h, l, c, v = float(row[1]), float(row[2]), float(row[3]), float(row[4]), float(row[5])
+                rows.append({
+                    "close_time": pd.to_datetime(ts, unit="ms", utc=True),
+                    "open": o, "high": h, "low": l, "close": c, "volume": v
+                })
+            df = pd.DataFrame(rows).sort_values("close_time")
+            return df
+    except Exception as e:
+        print("Bitget v1 (1H) fail:", e)
+
+    raise RuntimeError("Bitget: nessun dato ottenuto")
 
 def fetch_ohlc(symbol_key: str) -> pd.DataFrame:
     okx_id, ku_id, by_id, bg_id = COINS[symbol_key]

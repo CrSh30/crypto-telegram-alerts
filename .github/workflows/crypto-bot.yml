@@ -38,8 +38,10 @@ jobs:
         run: python bot.py
 
       # Salva/aggiorna la cache con l'ultimo stato (cooldown)
-      - name: Save state cache
-        uses: actions/cache/save@v4
+      - name: Restore state cache
+        uses: actions/cache/restore@v4
         with:
           path: .state
-          key: bot-state
+          key: bot-state-
+          restore-keys: |
+            bot-state-

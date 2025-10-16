@@ -1,159 +1,200 @@
 import os
-import time
 import requests
 import pandas as pd
 import pandas_ta as ta
 from datetime import datetime, timezone
 
-# === CONFIG ===
-SYMBOLS = {
-    # symbol_name : ("source", "pair_or_id")
-    "BTCUSDT": ("binance", "BTCUSDT"),
-    "ETHUSDT": ("binance", "ETHUSDT"),
-    "BNBUSDT": ("binance", "BNBUSDT"),
-    "SOLUSDT": ("binance", "SOLUSDT"),
-    "BGBUSD":  ("coingecko", "bitget-token"),  # CoinGecko id
+# ====== CONFIG ======
+COINS = {
+    # simbolo logico : (okx_instId, kucoin_symbol, bybit_symbol, bitget_symbol)
+    "BTC": ("BTC-USDT", "BTC-USDT", "BTCUSDT", None),
+    "ETH": ("ETH-USDT", "ETH-USDT", "ETHUSDT", None),
+    "BNB": ("BNB-USDT", "BNB-USDT", "BNBUSDT", None),
+    "SOL": ("SOL-USDT", "SOL-USDT", "SOLUSDT", None),
+    "BGB": (None,       None,       None,       "BGBUSDT"),  # Bitget only
 }
-INTERVAL = "1h"   # timeframe per Binance
-CANDLES  = 200    # numero di candele da scaricare
+TF = "1h"          # timeframe logico
+CANDLES = 200      # numero di barre da scaricare
 
-# Soglie RSI:
+# Soglie RSI
 RSI_LOW  = 35
 RSI_HIGH = 70
 
-# Parametri MACD standard:
-MACD_FAST = 12
-MACD_SLOW = 26
+# MACD standard
+MACD_FAST   = 12
+MACD_SLOW   = 26
 MACD_SIGNAL = 9
 
-# Telegram secrets dalle GitHub Secrets (env)
 TG_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TG_CHAT  = os.getenv("TELEGRAM_CHAT_ID")
 
+# ====== TELEGRAM ======
 def send_telegram(msg: str):
     if not TG_TOKEN or not TG_CHAT:
-        print("Telegram env vars mancanti.")
+        print("Telegram env vars mancanti")
         return
     url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
     payload = {"chat_id": TG_CHAT, "text": msg, "parse_mode": "HTML", "disable_web_page_preview": True}
     try:
-        r = requests.post(url, data=payload, timeout=15)
+        r = requests.post(url, data=payload, timeout=20)
         if r.status_code != 200:
-            print("Errore Telegram:", r.text)
+            print("Telegram error:", r.text)
     except Exception as e:
-        print("Eccezione Telegram:", e)
+        print("Telegram exception:", e)
 
-def fetch_binance_klines(symbol: str, interval="1h", limit=200) -> pd.DataFrame:
-    url = "https://api.binance.com/api/v3/klines"
-    params = {"symbol": symbol, "interval": interval, "limit": limit}
-    r = requests.get(url, params=params, timeout=15)
+# ====== FETCHERS SENZA CHIAVI ======
+def fetch_okx(instId: str, limit=200, bar="1H") -> pd.DataFrame:
+    # OKX: ts, o, h, l, c, vol, volCcy, volCcyQuote, confirm
+    url = "https://www.okx.com/api/v5/market/candles"
+    params = {"instId": instId, "bar": bar, "limit": str(limit)}
+    r = requests.get(url, params=params, timeout=25)
     r.raise_for_status()
-    data = r.json()
-    cols = [
-        "open_time", "open", "high", "low", "close", "volume",
-        "close_time", "qav", "trades", "taker_base", "taker_quote", "ignore"
-    ]
-    df = pd.DataFrame(data, columns=cols)
-    # Converti tipi
-    df["open_time"]  = pd.to_datetime(df["open_time"], unit="ms", utc=True)
-    df["close_time"] = pd.to_datetime(df["close_time"], unit="ms", utc=True)
-    for c in ["open","high","low","close","volume"]:
-        df[c] = pd.to_numeric(df[c], errors="coerce")
-    # Usa solo candele CHIUSE: scarta l'ultima se è in formazione (binance fornisce solo chiuse, ma teniamo penultima per sicurezza)
-    # N.B.: Binance restituisce candele chiuse, ma per minimizzare falsi segnali useremo la penultima per i "crossing"
+    data = r.json().get("data", [])
+    if not data:
+        raise RuntimeError("OKX: no data")
+    rows = []
+    for row in data:
+        ts, o, h, l, c = int(row[0]), float(row[1]), float(row[2]), float(row[3]), float(row[4])
+        rows.append({"close_time": pd.to_datetime(ts, unit="ms", utc=True), "open": o, "high": h, "low": l, "close": c, "volume": float(row[5])})
+    df = pd.DataFrame(rows)
+    df.sort_values("close_time", inplace=True)
     return df
 
-def fetch_coingecko_hourly_closes(coin_id: str, days=2) -> pd.DataFrame:
-    # restituisce serie oraria (timestamp, price)
-    url = f"https://api.coingecko.com/api/v3/coins/{coin_id}/market_chart"
-    params = {"vs_currency": "usd", "days": days, "interval": "hourly"}
-    r = requests.get(url, params=params, timeout=20)
+def fetch_kucoin(symbol: str, limit=200, typ="1hour") -> pd.DataFrame:
+    # KuCoin: [time, open, close, high, low, volume, turnover]
+    url = "https://api.kucoin.com/api/v1/market/candles"
+    params = {"type": typ, "symbol": symbol}
+    r = requests.get(url, params=params, timeout=25)
     r.raise_for_status()
-    data = r.json()
-    prices = data.get("prices", [])
-    if not prices:
-        raise RuntimeError("CoinGecko nessun dato.")
-    # prices: [ [ms, price], ... ]
-    df = pd.DataFrame(prices, columns=["time", "close"])
-    df["time"] = pd.to_datetime(df["time"], unit="ms", utc=True)
-    df["open"] = df["high"] = df["low"] = df["close"]  # OHLC fittizi dal close per TA
-    df["volume"] = 0.0
-    df.rename(columns={"time":"close_time"}, inplace=True)
+    data = r.json().get("data", [])
+    if not data:
+        raise RuntimeError("KuCoin: no data")
+    rows = []
+    for row in data:
+        # Kucoin time è in secondi string
+        ts = int(row[0]) * 1000
+        o, c, h, l, v = map(float, row[1:6])
+        rows.append({"close_time": pd.to_datetime(ts, unit="ms", utc=True), "open": o, "high": h, "low": l, "close": c, "volume": v})
+    df = pd.DataFrame(rows)
+    df.sort_values("close_time", inplace=True)
     return df
 
+def fetch_bybit(symbol: str, limit=200, interval="60") -> pd.DataFrame:
+    # Bybit v5: list of [start, open, high, low, close, volume, turnover]
+    url = "https://api.bybit.com/v5/market/kline"
+    params = {"category": "spot", "symbol": symbol, "interval": interval, "limit": str(limit)}
+    r = requests.get(url, params=params, timeout=25)
+    r.raise_for_status()
+    data = r.json().get("result", {}).get("list", [])
+    if not data:
+        raise RuntimeError("Bybit: no data")
+    rows = []
+    for row in data:
+        ts = int(row[0])
+        o, h, l, c, v = float(row[1]), float(row[2]), float(row[3]), float(row[4]), float(row[5])
+        rows.append({"close_time": pd.to_datetime(ts, unit="ms", utc=True), "open": o, "high": h, "low": l, "close": c, "volume": v})
+    df = pd.DataFrame(rows)
+    df.sort_values("close_time", inplace=True)
+    return df
+
+def fetch_bitget(symbol: str, limit=200, granularity="60"):
+    # Bitget v2 market/candles (spot): [ts, o, h, l, c, vol, quoteVol]
+    url = "https://api.bitget.com/api/v2/market/candles"
+    params = {"symbol": symbol, "granularity": granularity, "limit": str(limit)}
+    r = requests.get(url, params=params, timeout=25)
+    r.raise_for_status()
+    data = r.json().get("data", [])
+    if not data:
+        raise RuntimeError("Bitget: no data")
+    rows = []
+    for row in data:
+        ts = int(row[0])
+        o, h, l, c, v = float(row[1]), float(row[2]), float(row[3]), float(row[4]), float(row[5])
+        rows.append({"close_time": pd.to_datetime(ts, unit="ms", utc=True), "open": o, "high": h, "low": l, "close": c, "volume": v})
+    df = pd.DataFrame(rows)
+    df.sort_values("close_time", inplace=True)
+    return df
+
+def fetch_ohlc(symbol_key: str) -> pd.DataFrame:
+    okx_id, ku_id, by_id, bg_id = COINS[symbol_key]
+    # 1) OKX
+    if okx_id:
+        try:
+            return fetch_okx(okx_id, limit=CANDLES, bar="1H")
+        except Exception as e:
+            print(symbol_key, "OKX fail:", e)
+    # 2) KuCoin
+    if ku_id:
+        try:
+            return fetch_kucoin(ku_id, limit=CANDLES, typ="1hour")
+        except Exception as e:
+            print(symbol_key, "KuCoin fail:", e)
+    # 3) Bybit
+    if by_id:
+        try:
+            return fetch_bybit(by_id, limit=CANDLES, interval="60")
+        except Exception as e:
+            print(symbol_key, "Bybit fail:", e)
+    # 4) Bitget (solo per BGB, ma lasciamo fallback)
+    if bg_id:
+        try:
+            return fetch_bitget(bg_id, limit=CANDLES, granularity="60")
+        except Exception as e:
+            print(symbol_key, "Bitget fail:", e)
+    raise RuntimeError("Nessuna fonte disponibile")
+
+# ====== INDICATORS ======
 def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
-    # RSI
     df["rsi"] = ta.rsi(df["close"], length=14)
-    # MACD
     macd = ta.macd(df["close"], fast=MACD_FAST, slow=MACD_SLOW, signal=MACD_SIGNAL)
     df["macd"] = macd["MACD_12_26_9"]
     df["macd_signal"] = macd["MACDs_12_26_9"]
     return df
 
 def last_closed_rows(df: pd.DataFrame):
-    # Consideriamo penultima candela (chiusa) e la precedente per verificare "crossing"
     if len(df) < 3:
         return None, None
-    return df.iloc[-2], df.iloc[-3]
+    return df.iloc[-2], df.iloc[-3]  # penultima (chiusa) e precedente
 
-def check_rsi_signals(sym: str, row, prev) -> list:
-    signals = []
-    # Crossing below RSI_LOW
+def check_rsi(row, prev):
+    msgs = []
     if pd.notna(row["rsi"]) and pd.notna(prev["rsi"]):
         if prev["rsi"] >= RSI_LOW and row["rsi"] < RSI_LOW:
-            signals.append(f"📉 <b>{sym}</b> RSI < {RSI_LOW} (Buy zone)\nRSI now: {row['rsi']:.2f}")
+            msgs.append(("rsi_low", f"RSI < {RSI_LOW} (Buy zone) — RSI {row['rsi']:.2f}"))
         if prev["rsi"] <= RSI_HIGH and row["rsi"] > RSI_HIGH:
-            signals.append(f"📈 <b>{sym}</b> RSI > {RSI_HIGH} (Take profit)\nRSI now: {row['rsi']:.2f}")
-    return signals
+            msgs.append(("rsi_high", f"RSI > {RSI_HIGH} (Take profit) — RSI {row['rsi']:.2f}"))
+    return msgs
 
-def check_macd_signals(sym: str, row, prev) -> list:
-    signals = []
+def check_macd(row, prev):
+    msgs = []
     if all(pd.notna([row["macd"], row["macd_signal"], prev["macd"], prev["macd_signal"]])):
-        # Bullish cross: MACD crosses above signal
         if prev["macd"] <= prev["macd_signal"] and row["macd"] > row["macd_signal"]:
-            signals.append(f"🟢 <b>{sym}</b> MACD bullish cross\nMACD {row['macd']:.4f} > Signal {row['macd_signal']:.4f}")
-        # Bearish cross
+            msgs.append(("macd_up",  f"MACD bullish cross — {row['macd']:.4f} > {row['macd_signal']:.4f}"))
         if prev["macd"] >= prev["macd_signal"] and row["macd"] < row["macd_signal"]:
-            signals.append(f"🔴 <b>{sym}</b> MACD bearish cross\nMACD {row['macd']:.4f} < Signal {row['macd_signal']:.4f}")
-    return signals
+            msgs.append(("macd_dn",  f"MACD bearish cross — {row['macd']:.4f} < {row['macd_signal']:.4f}"))
+    return msgs
 
 def run_once():
     all_msgs = []
-
-    for sym, (source, ident) in SYMBOLS.items():
+    for sym in COINS.keys():
         try:
-            if source == "binance":
-                df = fetch_binance_klines(ident, interval=INTERVAL, limit=CANDLES)
-                df["close_time"] = pd.to_datetime(df["close_time"], utc=True)
-            elif source == "coingecko":
-                df = fetch_coingecko_hourly_closes(ident, days=3)
-            else:
-                continue
-
+            df = fetch_ohlc(sym)
             df = compute_indicators(df)
             row, prev = last_closed_rows(df)
             if row is None:
                 continue
-
             ts = row["close_time"].strftime("%Y-%m-%d %H:%M UTC")
             price = row["close"]
-
-            rsi_msgs  = check_rsi_signals(sym, row, prev)
-            macd_msgs = check_macd_signals(sym, row, prev)
-
-            for m in (rsi_msgs + macd_msgs):
-                all_msgs.append(f"{m}\nPrice: {price:.6f}\nTime: {ts}")
-
+            sigs = check_rsi(row, prev) + check_macd(row, prev)
+            for _, text in sigs:
+                all_msgs.append(f"• <b>{sym}</b> — {text}\nPrice: {price:.6f} USDT\nTime: {ts}")
         except Exception as e:
             all_msgs.append(f"⚠️ <b>{sym}</b> errore dati: {e}")
 
-    if not all_msgs:
+    if all_msgs:
+        send_telegram("📣 <b>Crypto Alerts (1h)</b>\n" + "\n\n".join(all_msgs))
+    else:
         print("Nessun segnale questa run.")
-        return
-
-    text = "📣 <b>Crypto Alerts (1h)</b>\n" + "\n\n".join(all_msgs)
-    print(text)
-    send_telegram(text)
 
 if __name__ == "__main__":
     run_once()

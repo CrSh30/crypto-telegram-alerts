@@ -2,7 +2,7 @@ name: Crypto RSI/MACD Bot
 
 on:
   schedule:
-    - cron: "0 * * * *"   # esegue il bot ogni ora
+    - cron: "2 * * * *"
   workflow_dispatch:
 
 jobs:

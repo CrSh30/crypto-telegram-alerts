@@ -348,6 +348,11 @@ def build_daily_trend_report() -> str:
 
 # ====== MAIN LOGIC (BUY only, 1H + trend 1D) ======
 def run_once():
+    # --- TEST MESSAGGIO TELEGRAM ---
+    send_telegram("🧪 Test: run OK — invio forzato")
+    summary = build_daily_trend_report()
+    send_telegram(f"🗞️ Test Daily Trend 1D\n{summary}")
+    # --- FINE TEST ---
     state = load_state()
     messages = []
 
@@ -405,11 +410,7 @@ def run_once():
             send_telegram("✅ Heartbeat: bot attivo e sincronizzato")
             mark_heartbeat_sent(state)
     except Exception as e:
-        print("Heartbeat error:", e)
-
-send_telegram("🧪 Test: run OK — invio forzato")
-summary = build_daily_trend_report()
-send_telegram(f"🗞️ Test Daily Trend 1D\n{summary}")    
+        print("Heartbeat error:", e)  
 
     # Salva stato
     save_state(state)

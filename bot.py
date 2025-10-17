@@ -348,11 +348,6 @@ def build_daily_trend_report() -> str:
 
 # ====== MAIN LOGIC (BUY only, 1H + trend 1D) ======
 def run_once():
-    # --- TEST MESSAGGIO TELEGRAM ---
-    send_telegram("🧪 Test: run OK — invio forzato")
-    summary = build_daily_trend_report()
-    send_telegram(f"🗞️ Test Daily Trend 1D\n{summary}")
-    # --- FINE TEST ---
     state = load_state()
     messages = []
 

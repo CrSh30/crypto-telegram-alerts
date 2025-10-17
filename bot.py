@@ -296,27 +296,25 @@ def today_in_rome():
 
 
 def should_send_daily_report(state: dict) -> bool:
-    # invia tra le 08:00 e le 08:05 ora italiana, una sola volta al giorno
     now_it = datetime.now(ZoneInfo("Europe/Rome"))
-    if not (now_it.hour == 8 and now_it.minute < 5):
+    # Finestra estesa: 08:00–08:15
+    if not (now_it.hour == 8 and now_it.minute < 15):
         return False
     last = state.get("_daily_report_date")
-    return str(today_in_rome()) != str(last)
+    return str(now_it.date()) != str(last)
 
 
 def mark_daily_report_sent(state: dict):
     state["_daily_report_date"] = str(today_in_rome())
+    
 
 def should_send_heartbeat(state: dict) -> bool:
-    """
-    Invia l'heartbeat una sola volta al giorno nella finestra 08:00–08:05 Europe/Rome.
-    (Il workflow gira all'ora spaccata; usiamo la stessa finestra del daily.)
-    """
     now_it = datetime.now(ZoneInfo("Europe/Rome"))
-    if not (now_it.hour == 8 and now_it.minute < 5):
+    if not (now_it.hour == 8 and now_it.minute < 15):
         return False
     last = state.get("_heartbeat_date")
-    return str(today_in_rome()) != str(last)
+    return str(now_it.date()) != str(last)
+    
 
 def mark_heartbeat_sent(state: dict):
     state["_heartbeat_date"] = str(today_in_rome())
@@ -408,6 +406,10 @@ def run_once():
             mark_heartbeat_sent(state)
     except Exception as e:
         print("Heartbeat error:", e)
+
+send_telegram("🧪 Test: run OK — invio forzato")
+summary = build_daily_trend_report()
+send_telegram(f"🗞️ Test Daily Trend 1D\n{summary}")    
 
     # Salva stato
     save_state(state)

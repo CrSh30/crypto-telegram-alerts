@@ -190,19 +190,32 @@ def build_daily_trend_report():
 # ===== DAILY WINDOW CONTROL =====
 def now_rome(): return datetime.now(ZoneInfo("Europe/Rome"))
 def should_send_daily_report(state):
-    n=now_rome()
-    if not (n.hour==8 and n.minute<15): return False
-    return str(n.date())!=str(state.get("_daily_report_date"))
+    n = now_rome()
+    # Invia UNA SOLA VOLTA al giorno, alla prima run dopo le 08:00 Europe/Rome
+    # Se il runner parte in ritardo (08:18 / 09:02), la manda comunque.
+    if str(n.date()) == str(state.get("_daily_report_date")):
+        return False
+    return (n.hour == 8 and n.minute < 45) or (n.hour > 8)
 def mark_daily_report_sent(state): state["_daily_report_date"]=str(now_rome().date())
 def should_send_heartbeat(state):
-    n=now_rome()
-    if not (n.hour==8 and n.minute<15): return False
-    return str(n.date())!=str(state.get("_heartbeat_date"))
+    n = now_rome()
+    if str(n.date()) == str(state.get("_heartbeat_date")):
+        return False
+    return (n.hour == 8 and n.minute < 45) or (n.hour > 8)
 def mark_heartbeat_sent(state): state["_heartbeat_date"]=str(now_rome().date())
 
 # ===== MAIN =====
 def run_once():
     state=load_state()
+    # --- Sync logs: orari e stato daily/heartbeat
+try:
+    utc_now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    rome_now = now_rome().strftime("%Y-%m-%d %H:%M:%S Europe/Rome")
+    last_daily = state.get("_daily_report_date")
+    last_hb = state.get("_heartbeat_date")
+    print(f"[SYNC] Start: {utc_now} | Local: {rome_now} | last_daily={last_daily} | last_heartbeat={last_hb}")
+except Exception as e:
+    print("[SYNC] log error:", e)
     msgs=[]
     for sym in COINS.keys():
         try:
@@ -279,16 +292,22 @@ def run_once():
         print("Nessun BUY valido (filtrato da trend 1D / cooldown).")
 
     # --- Daily report + heartbeat (08:00-08:15 Europe/Rome) ---
-    try:
-        if should_send_daily_report(state):
-            summary=build_daily_trend_report()
-            send_telegram(f"🗞️ <b>Daily Trend 1D</b>\n{summary}")
-            mark_daily_report_sent(state)
-        if should_send_heartbeat(state):
-            send_telegram("✅ Heartbeat: bot attivo e sincronizzato")
-            mark_heartbeat_sent(state)
-    except Exception as e:
-        print("Daily/Heartbeat error:", e)
+try:
+    # --- Nuovo blocco con log migliorati ---
+    will_daily = should_send_daily_report(state)
+    will_hb = should_send_heartbeat(state)
+    print(f"[DAILY] should_send_daily_report={will_daily} | [HEARTBEAT] should_send_heartbeat={will_hb}")
+
+    if will_daily:
+        summary = build_daily_trend_report()
+        send_telegram(f"🗞️ <b>Daily Trend 1D</b>\n{summary}")
+        mark_daily_report_sent(state)
+
+    if will_hb:
+        send_telegram("✅ Heartbeat: bot attivo e sincronizzato")
+        mark_heartbeat_sent(state)
+except Exception as e:
+    print("Daily/Heartbeat error:", e)
 
     save_state(state)
 

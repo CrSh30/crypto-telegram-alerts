@@ -24,10 +24,10 @@ RSI_LOW = 30
 MACD_FAST, MACD_SLOW, MACD_SIGNAL = 12, 26, 9
 COOLDOWN_HOURS = 6
 
-# OPPORTUNITY (più largo)
-ENABLE_OPPORTUNITY = True
-RSI_WIDE = 40
-OPPORTUNITY_COOLDOWN_HOURS = 3
+# OPPORTUNITY (più largo) — può essere controllato via GitHub Secret
+ENABLE_OPPORTUNITY = os.getenv("ENABLE_OPPORTUNITY", "1") == "1"
+RSI_WIDE = int(os.getenv("RSI_WIDE", "40"))
+OPPORTUNITY_COOLDOWN_HOURS = int(os.getenv("OPPORTUNITY_COOLDOWN_HOURS", "3"))
 
 # Trend-change 4H opzionale (resta com'era)
 ENABLE_4H_TREND_ALERTS = True

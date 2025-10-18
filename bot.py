@@ -18,9 +18,18 @@ COINS = {
 
 CANDLES_1H = 240
 CANDLES_1D = 400
+
+# BUY (conservativo)
 RSI_LOW = 30
 MACD_FAST, MACD_SLOW, MACD_SIGNAL = 12, 26, 9
 COOLDOWN_HOURS = 6
+
+# OPPORTUNITY (più largo)
+ENABLE_OPPORTUNITY = True
+RSI_WIDE = 40
+OPPORTUNITY_COOLDOWN_HOURS = 3
+
+# Trend-change 4H opzionale (resta com'era)
 ENABLE_4H_TREND_ALERTS = True
 TREND4H_COOLDOWN_HOURS = 6
 
@@ -126,6 +135,7 @@ def add_indicators(df):
     df["rsi"] = ta.rsi(df["close"], length=14)
     macd = ta.macd(df["close"], fast=MACD_FAST, slow=MACD_SLOW, signal=MACD_SIGNAL)
     df["macd"], df["macd_signal"] = macd["MACD_12_26_9"], macd["MACDs_12_26_9"]
+    df["macd_hist"] = df["macd"] - df["macd_signal"]
     return df
 
 def last_closed_rows(df):
@@ -199,18 +209,44 @@ def run_once():
             df1=add_indicators(fetch_ohlc_1h(sym))
             row1,prev1=last_closed_rows(df1)
             if row1 is None: continue
+
             dfD=add_indicators(fetch_ohlc_1d(sym))
             rowD,prevD=last_closed_rows(dfD)
             trend_up=notna_all(rowD["macd"],rowD["macd_signal"]) and rowD["macd"]>rowD["macd_signal"]
-            if not trend_up: continue
 
-            # --- BUY SIGNAL ---
-            if notna_all(prev1["rsi"],row1["rsi"],prev1["macd"],prev1["macd_signal"],row1["macd"],row1["macd_signal"]):
+            # --- BUY SIGNAL (conservativo) ---
+            if trend_up and notna_all(prev1["rsi"],row1["rsi"],prev1["macd"],prev1["macd_signal"],row1["macd"],row1["macd_signal"]):
                 rsi_cross=prev1["rsi"]>=RSI_LOW and row1["rsi"]<RSI_LOW
                 macd_cross=prev1["macd"]<=prev1["macd_signal"] and row1["macd"]>row1["macd_signal"]
                 if rsi_cross and macd_cross and cooldown_ok(state,sym,"buy_combo",COOLDOWN_HOURS):
-                    msgs.append(f"🟢 <b>{sym}</b> BUY (RSI < {RSI_LOW} + MACD ↑)\nPrice: {row1['close']:.6f} USDT\nTime: {row1['close_time'].strftime('%Y-%m-%d %H:%M UTC')} | Trend 1D: MACD ↑")
+                    msgs.append(
+                        f"🟢 <b>{sym}</b> BUY (RSI < {RSI_LOW} + MACD ↑)\n"
+                        f"Price: {row1['close']:.6f} USDT\n"
+                        f"Time: {row1['close_time'].strftime('%Y-%m-%d %H:%M UTC')} | Trend 1D: MACD ↑"
+                    )
                     mark_sent(state,sym,"buy_combo")
+
+            # --- OPPORTUNITY (più largo) ---
+            if ENABLE_OPPORTUNITY and trend_up and notna_all(row1["rsi"], row1["macd"], row1["macd_signal"], row1["macd_hist"]):
+                rsi_ok = row1["rsi"] < RSI_WIDE
+                macd_ok = (row1["macd"] > row1["macd_signal"])
+                hist_ok = False
+                if prev1 is not None and len(df1) >= 4:
+                    h_1 = df1["macd_hist"].iloc[-2]
+                    h_2 = df1["macd_hist"].iloc[-3]
+                    h_3 = df1["macd_hist"].iloc[-4]
+                    if notna_all(h_1, h_2, h_3):
+                        hist_ok = (h_1 > h_2) and (h_2 > h_3)
+                if rsi_ok and (macd_ok or hist_ok) and cooldown_ok(state, sym, "opp_alert", OPPORTUNITY_COOLDOWN_HOURS):
+                    send_telegram(
+                        "🟡 <b>{}</b> OPPORTUNITY (wider)\n"
+                        "Price: {:.6f} USDT | RSI: {:.2f}\n"
+                        "MACD {} Signal | 1D Trend: UP".format(
+                            sym, row1["close"], row1["rsi"],
+                            ">" if row1["macd"] > row1["macd_signal"] else "≈"
+                        )
+                    )
+                    mark_sent(state, sym, "opp_alert")
 
             # --- TREND CHANGE ALERT (1D) ---
             curr_state=trend_state_from_row(rowD)
@@ -219,9 +255,9 @@ def run_once():
                 send_telegram(f"📈 <b>{sym}</b> Trend 1D cambiato: {prev_state or 'UNKNOWN'} → <b>{curr_state}</b>")
                 state.setdefault("_trend1d_state",{})[sym]=curr_state
                 if curr_state=="UP":
-                    send_telegram(f"🧭 {sym}: Trend 1D <b>BULLISH</b>. Strategia holder: attendi un pullback 1H (RSI<30 + MACD ↑) per entrare con qualità.")
+                    send_telegram(f"🧭 {sym}: Trend 1D <b>BULLISH</b>. Strategia holder: attendi un pullback 1H (RSI<30 + MACD ↑) o valuta 🟡 OPPORTUNITY.")
 
-            # --- TREND 4H (intraday) ---
+            # --- TREND 4H (intraday) opzionale ---
             if ENABLE_4H_TREND_ALERTS:
                 df4=add_indicators(resample_to_4h(df1))
                 row4,prev4=last_closed_rows(df4)

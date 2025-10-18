@@ -206,43 +206,53 @@ def mark_heartbeat_sent(state): state["_heartbeat_date"]=str(now_rome().date())
 
 # ===== MAIN =====
 def run_once():
-    state=load_state()
-    # --- Sync logs: orari e stato daily/heartbeat
-try:
-    utc_now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-    rome_now = now_rome().strftime("%Y-%m-%d %H:%M:%S Europe/Rome")
-    last_daily = state.get("_daily_report_date")
-    last_hb = state.get("_heartbeat_date")
-    print(f"[SYNC] Start: {utc_now} | Local: {rome_now} | last_daily={last_daily} | last_heartbeat={last_hb}")
-except Exception as e:
-    print("[SYNC] log error:", e)
-    msgs=[]
+    # Carica stato
+    state = load_state()
+
+    # --- Sync logs: orari e stato daily/heartbeat (solo log, non blocca nulla)
+    try:
+        utc_now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+        rome_now = now_rome().strftime("%Y-%m-%d %H:%M:%S Europe/Rome")
+        last_daily = state.get("_daily_report_date")
+        last_hb = state.get("_heartbeat_date")
+        print(f"[SYNC] Start: {utc_now} | Local: {rome_now} | last_daily={last_daily} | last_heartbeat={last_hb}")
+    except Exception as e:
+        print("[SYNC] log error:", e)
+
+    msgs = []
+
+    # === LOOP COIN PRINCIPALE ===
     for sym in COINS.keys():
         try:
-            df1=add_indicators(fetch_ohlc_1h(sym))
-            row1,prev1=last_closed_rows(df1)
-            if row1 is None: continue
+            # 1H
+            df1 = add_indicators(fetch_ohlc_1h(sym))
+            row1, prev1 = last_closed_rows(df1)
+            if row1 is None:
+                continue
 
-            dfD=add_indicators(fetch_ohlc_1d(sym))
-            rowD,prevD=last_closed_rows(dfD)
-            trend_up=notna_all(rowD["macd"],rowD["macd_signal"]) and rowD["macd"]>rowD["macd_signal"]
+            # 1D (filtro macro)
+            dfD = add_indicators(fetch_ohlc_1d(sym))
+            rowD, prevD = last_closed_rows(dfD)
+            trend_up = notna_all(rowD["macd"], rowD["macd_signal"]) and (rowD["macd"] > rowD["macd_signal"])
 
-            # --- BUY SIGNAL (conservativo) ---
-            if trend_up and notna_all(prev1["rsi"],row1["rsi"],prev1["macd"],prev1["macd_signal"],row1["macd"],row1["macd_signal"]):
-                rsi_cross=prev1["rsi"]>=RSI_LOW and row1["rsi"]<RSI_LOW
-                macd_cross=prev1["macd"]<=prev1["macd_signal"] and row1["macd"]>row1["macd_signal"]
-                if rsi_cross and macd_cross and cooldown_ok(state,sym,"buy_combo",COOLDOWN_HOURS):
+            # --- BUY (conservativo) ---
+            if trend_up and notna_all(prev1["rsi"], row1["rsi"], prev1["macd"], prev1["macd_signal"], row1["macd"], row1["macd_signal"]):
+                rsi_cross = (prev1["rsi"] >= RSI_LOW) and (row1["rsi"] < RSI_LOW)
+                macd_cross = (prev1["macd"] <= prev1["macd_signal"]) and (row1["macd"] > row1["macd_signal"])
+                if rsi_cross and macd_cross and cooldown_ok(state, sym, "buy_combo", COOLDOWN_HOURS):
                     msgs.append(
                         f"🟢 <b>{sym}</b> BUY (RSI < {RSI_LOW} + MACD ↑)\n"
                         f"Price: {row1['close']:.6f} USDT\n"
                         f"Time: {row1['close_time'].strftime('%Y-%m-%d %H:%M UTC')} | Trend 1D: MACD ↑"
                     )
-                    mark_sent(state,sym,"buy_combo")
+                    mark_sent(state, sym, "buy_combo")
 
             # --- OPPORTUNITY (più largo) ---
             if ENABLE_OPPORTUNITY and trend_up and notna_all(row1["rsi"], row1["macd"], row1["macd_signal"], row1["macd_hist"]):
-                rsi_ok = row1["rsi"] < RSI_WIDE
+                rsi_ok = (row1["rsi"] < RSI_WIDE)
                 macd_ok = (row1["macd"] > row1["macd_signal"])
+
+                # Istogramma MACD in miglioramento da 3 barre
                 hist_ok = False
                 if prev1 is not None and len(df1) >= 4:
                     h_1 = df1["macd_hist"].iloc[-2]
@@ -250,6 +260,7 @@ except Exception as e:
                     h_3 = df1["macd_hist"].iloc[-4]
                     if notna_all(h_1, h_2, h_3):
                         hist_ok = (h_1 > h_2) and (h_2 > h_3)
+
                 if rsi_ok and (macd_ok or hist_ok) and cooldown_ok(state, sym, "opp_alert", OPPORTUNITY_COOLDOWN_HOURS):
                     send_telegram(
                         "🟡 <b>{}</b> OPPORTUNITY (wider)\n"
@@ -261,55 +272,55 @@ except Exception as e:
                     )
                     mark_sent(state, sym, "opp_alert")
 
-            # --- TREND CHANGE ALERT (1D) ---
-            curr_state=trend_state_from_row(rowD)
-            prev_state=state.get("_trend1d_state",{}).get(sym)
-            if curr_state!=prev_state:
+            # --- TREND CHANGE 1D ---
+            curr_state = trend_state_from_row(rowD)
+            prev_state = state.get("_trend1d_state", {}).get(sym)
+            if curr_state != prev_state:
                 send_telegram(f"📈 <b>{sym}</b> Trend 1D cambiato: {prev_state or 'UNKNOWN'} → <b>{curr_state}</b>")
-                state.setdefault("_trend1d_state",{})[sym]=curr_state
-                if curr_state=="UP":
-                    send_telegram(f"🧭 {sym}: Trend 1D <b>BULLISH</b>. Strategia holder: attendi un pullback 1H (RSI<30 + MACD ↑) o valuta 🟡 OPPORTUNITY.")
+                state.setdefault("_trend1d_state", {})[sym] = curr_state
+                if curr_state == "UP":
+                    send_telegram(f"🧭 {sym}: Trend 1D <b>BULLISH</b>. Strategia holder: attendi pullback 1H (RSI<30 + MACD ↑) o valuta 🟡 OPPORTUNITY.")
 
-            # --- TREND 4H (intraday) opzionale ---
+            # --- TREND 4H opzionale ---
             if ENABLE_4H_TREND_ALERTS:
-                df4=add_indicators(resample_to_4h(df1))
-                row4,prev4=last_closed_rows(df4)
+                df4 = add_indicators(resample_to_4h(df1))
+                row4, prev4 = last_closed_rows(df4)
                 if row4 is not None:
-                    curr4=trend_state_from_row(row4)
-                    key4=f"trend4h_{curr4}"
-                    last_key=state.get("_trend4h_state",{}).get(sym)
-                    if curr4!=last_key and cooldown_ok(state,sym,"trend4h_alert",TREND4H_COOLDOWN_HOURS):
+                    curr4 = trend_state_from_row(row4)
+                    last4 = state.get("_trend4h_state", {}).get(sym)
+                    if curr4 != last4 and cooldown_ok(state, sym, "trend4h_alert", TREND4H_COOLDOWN_HOURS):
                         send_telegram(f"⏱️ <b>{sym}</b> Trend 4H → <b>{curr4}</b>")
-                        state.setdefault("_trend4h_state",{})[sym]=curr4
-                        mark_sent(state,sym,"trend4h_alert")
+                        state.setdefault("_trend4h_state", {})[sym] = curr4
+                        mark_sent(state, sym, "trend4h_alert")
 
         except Exception as e:
-            print(sym,"errore:",e)
+            print(sym, "errore:", e)
 
+    # Invio batch BUY (se ci sono)
     if msgs:
-        send_telegram("📣 <b>Crypto BUY Alerts (Holder)</b>\n"+"\n\n".join(msgs))
+        send_telegram("📣 <b>Crypto BUY Alerts (Holder)</b>\n" + "\n\n".join(msgs))
     else:
         print("Nessun BUY valido (filtrato da trend 1D / cooldown).")
 
-    # --- Daily report + heartbeat (08:00-08:15 Europe/Rome) ---
-try:
-    # --- Nuovo blocco con log migliorati ---
-    will_daily = should_send_daily_report(state)
-    will_hb = should_send_heartbeat(state)
-    print(f"[DAILY] should_send_daily_report={will_daily} | [HEARTBEAT] should_send_heartbeat={will_hb}")
+    # --- DAILY / HEARTBEAT robusti ai ritardi
+    try:
+        will_daily = should_send_daily_report(state)
+        will_hb = should_send_heartbeat(state)
+        print(f"[DAILY] should_send_daily_report={will_daily} | [HEARTBEAT] should_send_heartbeat={will_hb}")
 
-    if will_daily:
-        summary = build_daily_trend_report()
-        send_telegram(f"🗞️ <b>Daily Trend 1D</b>\n{summary}")
-        mark_daily_report_sent(state)
+        if will_daily:
+            summary = build_daily_trend_report()
+            send_telegram(f"🗞️ <b>Daily Trend 1D</b>\n{summary}")
+            mark_daily_report_sent(state)
 
-    if will_hb:
-        send_telegram("✅ Heartbeat: bot attivo e sincronizzato")
-        mark_heartbeat_sent(state)
-except Exception as e:
-    print("Daily/Heartbeat error:", e)
+        if will_hb:
+            send_telegram("✅ Heartbeat: bot attivo e sincronizzato")
+            mark_heartbeat_sent(state)
+    except Exception as e:
+        print("Daily/Heartbeat error:", e)
 
+    # Salva stato a fine run (sempre dentro run_once)
     save_state(state)
-
+    
 if __name__=="__main__":
     run_once()

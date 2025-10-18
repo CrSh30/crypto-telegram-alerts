@@ -2,7 +2,8 @@ name: Crypto RSI/MACD Bot
 
 on:
   schedule:
-    - cron: "2 * * * *"
+    - cron: "2 * * * *"     # run oraria standard
+    - cron: "2 6 * * *"     # extra spinta per daily: 06:02 UTC (≈ 08:02 Rome in CEST)
   workflow_dispatch:
 
 jobs:

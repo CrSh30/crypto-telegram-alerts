@@ -1,4 +1,4 @@
-# bot.py — main (patched)
+# bot.py — main (fully patched, robust to missing 1D rows)
 
 import os
 import json
@@ -52,6 +52,20 @@ def notna_all(*vals) -> bool:
         if v is None or pd.isna(v):
             return False
     return True
+
+def safe_get(row, key, default=None):
+    """Legge 'key' da una pandas Series o dict. Se row è None o manca la chiave, ritorna default."""
+    if row is None:
+        return default
+    try:
+        if key in row:  # pandas Series
+            return row[key]
+    except Exception:
+        pass
+    try:
+        return row.get(key, default)  # dict-like
+    except Exception:
+        return default
 
 def send_telegram(msg: str):
     if not TG_TOKEN or not TG_CHAT:
@@ -218,13 +232,8 @@ def last_closed_rows(df):
 def trend_state_from_row(row):
     if row is None:
         return "NEUTRAL"
-    try:
-        # supporta sia Series che dict-like
-        macd_val = row["macd"] if "macd" in row else row.get("macd")
-        sig_val  = row["macd_signal"] if "macd_signal" in row else row.get("macd_signal")
-    except Exception:
-        macd_val = row.get("macd") if isinstance(row, dict) else None
-        sig_val  = row.get("macd_signal") if isinstance(row, dict) else None
+    macd_val = safe_get(row, "macd")
+    sig_val  = safe_get(row, "macd_signal")
     if notna_all(macd_val, sig_val):
         if abs(macd_val - sig_val) < 1e-12:
             return "NEUTRAL"
@@ -279,11 +288,11 @@ def build_daily_trend_report():
             last = dfD.iloc[-2]   # ultima 1D chiusa
             prev = dfD.iloc[-3]
 
-            trend_up = notna_all(last.get("macd"), last.get("macd_signal")) and last["macd"] > last["macd_signal"]
+            trend_up = notna_all(safe_get(last, "macd"), safe_get(last, "macd_signal")) and safe_get(last, "macd") > safe_get(last, "macd_signal")
             arrow = "↑" if trend_up else "↓"
 
-            mdp = macd_delta_pct(last.get("macd"), last.get("macd_signal"))
-            price_pct = pct(float(last["close"]), float(prev["close"]))
+            mdp = macd_delta_pct(safe_get(last, "macd"), safe_get(last, "macd_signal"))
+            price_pct = pct(float(safe_get(last, "close")), float(safe_get(prev, "close")))
 
             parts.append(f"{sym} {arrow} MACDΔ {mdp:+.2f}% | PriceΔ {price_pct:+.2f}%")
 
@@ -347,38 +356,49 @@ def run_once():
                 print(sym, "skip: no 1H last closed")
                 continue
 
-            # 1D (filtro macro)
-            dfD = add_indicators(fetch_ohlc_1d(sym))
-            rowD, prevD = last_closed_rows(dfD)
+            # 1D (filtro macro) — robusto a None
+            try:
+                dfD = add_indicators(fetch_ohlc_1d(sym))
+                rowD, prevD = last_closed_rows(dfD)
+            except Exception as e:
+                print(sym, "1D fetch/add_indicators fail:", e)
+                rowD, prevD = None, None
+
             if rowD is None:
                 print(sym, "skip: no 1D last closed")
+                macdD = sigD = None
                 trend_up = False
             else:
-                trend_up = notna_all(rowD["macd"], rowD["macd_signal"]) and (rowD["macd"] > rowD["macd_signal"])
+                macdD = safe_get(rowD, "macd")
+                sigD  = safe_get(rowD, "macd_signal")
+                trend_up = notna_all(macdD, sigD) and (macdD > sigD)
 
             # --- BUY ---
-            if trend_up and notna_all(prev1["rsi"], row1["rsi"], prev1["macd"], prev1["macd_signal"], row1["macd"], row1["macd_signal"]):
-                rsi_cross = (prev1["rsi"] >= RSI_LOW) and (row1["rsi"] < RSI_LOW)
-                macd_cross = (prev1["macd"] <= prev1["macd_signal"]) and (row1["macd"] > row1["macd_signal"])
+            if trend_up and notna_all(safe_get(prev1, "rsi"), safe_get(row1, "rsi"),
+                                      safe_get(prev1, "macd"), safe_get(prev1, "macd_signal"),
+                                      safe_get(row1, "macd"), safe_get(row1, "macd_signal")):
+                rsi_cross = (safe_get(prev1, "rsi") >= RSI_LOW) and (safe_get(row1, "rsi") < RSI_LOW)
+                macd_cross = (safe_get(prev1, "macd") <= safe_get(prev1, "macd_signal")) and (safe_get(row1, "macd") > safe_get(row1, "macd_signal"))
                 if rsi_cross and macd_cross and cooldown_ok(state, sym, "buy_combo", COOLDOWN_HOURS):
                     msgs.append(
                         f"🟢 <b>{sym}</b> BUY (RSI < {RSI_LOW} + MACD ↑)\n"
-                        f"Price: {row1['close']:.6f} USDT\n"
-                        f"Time: {row1['close_time'].strftime('%Y-%m-%d %H:%M UTC')} | Trend 1D: MACD ↑"
+                        f"Price: {safe_get(row1,'close'):.6f} USDT\n"
+                        f"Time: {safe_get(row1,'close_time').strftime('%Y-%m-%d %H:%M UTC')} | Trend 1D: MACD ↑"
                     )
                     mark_sent(state, sym, "buy_combo")
 
             # --- OPPORTUNITY (wide) ---
-            if ENABLE_OPPORTUNITY and trend_up and notna_all(row1["rsi"], row1["macd"], row1["macd_signal"], row1["macd_hist"]):
-                rsi_ok = (row1["rsi"] < RSI_WIDE)
-                macd_ok = (row1["macd"] > row1["macd_signal"])
+            if ENABLE_OPPORTUNITY and trend_up and notna_all(safe_get(row1,"rsi"), safe_get(row1,"macd"),
+                                                             safe_get(row1,"macd_signal"), safe_get(row1,"macd_hist")):
+                rsi_ok = (safe_get(row1, "rsi") < RSI_WIDE)
+                macd_ok = (safe_get(row1, "macd") > safe_get(row1, "macd_signal"))
 
                 # istogramma in miglioramento 3 barre
                 hist_ok = False
                 if prev1 is not None and len(df1) >= 4:
-                    h_1 = df1["macd_hist"].iloc[-2]
-                    h_2 = df1["macd_hist"].iloc[-3]
-                    h_3 = df1["macd_hist"].iloc[-4]
+                    h_1 = safe_get(df1.iloc[-2], "macd_hist")
+                    h_2 = safe_get(df1.iloc[-3], "macd_hist")
+                    h_3 = safe_get(df1.iloc[-4], "macd_hist")
                     if notna_all(h_1, h_2, h_3):
                         hist_ok = (h_1 > h_2) and (h_2 > h_3)
 
@@ -387,15 +407,15 @@ def run_once():
                         "🟡 <b>{}</b> OPPORTUNITY (wider)\n"
                         "Price: {:.6f} USDT | RSI: {:.2f}\n"
                         "MACD {} Signal | 1D Trend: UP".format(
-                            sym, row1["close"], row1["rsi"],
-                            ">" if row1["macd"] > row1["macd_signal"] else "≈"
+                            sym, safe_get(row1,"close"), safe_get(row1,"rsi"),
+                            ">" if safe_get(row1,"macd") > safe_get(row1,"macd_signal") else "≈"
                         )
                     )
                     mark_sent(state, sym, "opp_alert")
 
-            # --- Trend change 1D ---
-            if rowD is not None:
-                curr_state = trend_state_from_row(rowD)
+            # --- Trend change 1D (safe) ---
+            if rowD is not None and notna_all(macdD, sigD):
+                curr_state = "UP" if macdD > sigD else ("NEUTRAL" if abs(macdD - sigD) < 1e-12 else "DOWN")
                 prev_state = state.get("_trend1d_state", {}).get(sym)
                 if curr_state != prev_state:
                     send_telegram(f"📈 <b>{sym}</b> Trend 1D cambiato: {prev_state or 'UNKNOWN'} → <b>{curr_state}</b>")

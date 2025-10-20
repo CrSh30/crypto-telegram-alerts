@@ -1,4 +1,4 @@
-# bot.py — full patched version
+# bot.py — main (patched)
 
 import os
 import json
@@ -13,11 +13,11 @@ from zoneinfo import ZoneInfo
 
 # Symbols mapping: (OKX instId, Bybit symbol, Bitget spot symbol)
 COINS = {
-    "BTC": ("BTC-USDT", "BTCUSDT", None),   # Bitget not needed (OKX/Bybit ok)
+    "BTC": ("BTC-USDT", "BTCUSDT", None),
     "ETH": ("ETH-USDT", "ETHUSDT", None),
     "BNB": ("BNB-USDT", "BNBUSDT", None),
     "SOL": ("SOL-USDT", "SOLUSDT", None),
-    "BGB": (None, None, "BGBUSDT"),         # BGB via Bitget spot
+    "BGB": (None, None, "BGBUSDT"),  # BGB via Bitget spot
 }
 
 CANDLES_1H = 240
@@ -108,21 +108,27 @@ def fetch_bybit(sym, limit, interval):
     return pd.DataFrame(rows).sort_values("close_time")
 
 def fetch_bitget_spot(sym, limit, granularity="1h"):
-    # Normalizza per lo spot v2:
-    #  - 1h OK
-    #  - daily deve essere "1day" (non 1D/1d)
-    #  - limit consigliato <= 100
-    g = granularity.lower()
-    if g in ("1d","1day","day","d"):
+    # Normalizza granularity per Spot v2:
+    g = (granularity or "").lower().strip()
+    if g in ("1d", "day", "d"):
         g = "1day"
-    if limit > 100:
+    if g == "1":
+        g = "1h"  # safety
+
+    # Bitget spot v2: limit consigliato <= 100
+    if limit is None or limit <= 0:
         limit = 100
+    else:
+        limit = min(int(limit), 100)
+
     urls = [
+        # Primo tentativo: candles (senza endTime)
         ("https://api.bitget.com/api/v2/spot/market/candles",
          {"symbol": sym, "granularity": g, "limit": limit}),
-        # fallback SOLO se serve e con endTime obbligatorio
+        # Fallback: history-candles (richiede endTime)
         ("https://api.bitget.com/api/v2/spot/market/history-candles",
-         {"symbol": sym, "granularity": g, "limit": limit, "endTime": int(datetime.now(timezone.utc).timestamp()*1000)}),
+         {"symbol": sym, "granularity": g, "limit": limit,
+          "endTime": int(datetime.now(timezone.utc).timestamp() * 1000)}),
     ]
     for url, p in urls:
         try:
@@ -142,6 +148,7 @@ def fetch_bitget_spot(sym, limit, granularity="1h"):
                 return df
         except Exception as e:
             print(f"Bitget spot fetch fail ({url}):", e)
+
     raise RuntimeError("Bitget spot: no data")
 
 def fetch_ohlc_1h(sym):
@@ -178,10 +185,11 @@ def fetch_ohlc_1d(sym):
             print(sym, "Bybit 1D fail:", e)
     if bg:
         try:
-            # Bitget spot daily = "1day" e limit <= 100
+            # Bitget spot daily: "1day" e limit <= 100
             return fetch_bitget_spot(bg, min(CANDLES_1D, 100), "1day")
         except Exception as e:
             print(sym, "Bitget 1D fail:", e)
+    print("DEBUG 1D miss:", sym)
     raise RuntimeError("no 1D data for " + sym)
 
 def resample_to_4h(df_1h: pd.DataFrame) -> pd.DataFrame:
@@ -208,10 +216,19 @@ def last_closed_rows(df):
     return df.iloc[-2], df.iloc[-3]   # penultima = ultima CHIUSA
 
 def trend_state_from_row(row):
-    if notna_all(row.get("macd"), row.get("macd_signal")):
-        if abs(row["macd"] - row["macd_signal"]) < 1e-12:
+    if row is None:
+        return "NEUTRAL"
+    try:
+        # supporta sia Series che dict-like
+        macd_val = row["macd"] if "macd" in row else row.get("macd")
+        sig_val  = row["macd_signal"] if "macd_signal" in row else row.get("macd_signal")
+    except Exception:
+        macd_val = row.get("macd") if isinstance(row, dict) else None
+        sig_val  = row.get("macd_signal") if isinstance(row, dict) else None
+    if notna_all(macd_val, sig_val):
+        if abs(macd_val - sig_val) < 1e-12:
             return "NEUTRAL"
-        return "UP" if row["macd"] > row["macd_signal"] else "DOWN"
+        return "UP" if macd_val > sig_val else "DOWN"
     return "NEUTRAL"
 
 # ========= STATE =========
@@ -287,7 +304,6 @@ def now_rome():
 
 def should_send_daily_report(state):
     n = now_rome()
-    # Invia UNA SOLA VOLTA al giorno, alla prima run dopo le 08:00 Europe/Rome
     if str(n.date()) == str(state.get("_daily_report_date")):
         return False
     return n.hour >= 8
@@ -328,12 +344,17 @@ def run_once():
             df1 = add_indicators(fetch_ohlc_1h(sym))
             row1, prev1 = last_closed_rows(df1)
             if row1 is None:
+                print(sym, "skip: no 1H last closed")
                 continue
 
             # 1D (filtro macro)
             dfD = add_indicators(fetch_ohlc_1d(sym))
             rowD, prevD = last_closed_rows(dfD)
-            trend_up = notna_all(rowD["macd"], rowD["macd_signal"]) and (rowD["macd"] > rowD["macd_signal"])
+            if rowD is None:
+                print(sym, "skip: no 1D last closed")
+                trend_up = False
+            else:
+                trend_up = notna_all(rowD["macd"], rowD["macd_signal"]) and (rowD["macd"] > rowD["macd_signal"])
 
             # --- BUY ---
             if trend_up and notna_all(prev1["rsi"], row1["rsi"], prev1["macd"], prev1["macd_signal"], row1["macd"], row1["macd_signal"]):
@@ -373,13 +394,14 @@ def run_once():
                     mark_sent(state, sym, "opp_alert")
 
             # --- Trend change 1D ---
-            curr_state = trend_state_from_row(rowD)
-            prev_state = state.get("_trend1d_state", {}).get(sym)
-            if curr_state != prev_state:
-                send_telegram(f"📈 <b>{sym}</b> Trend 1D cambiato: {prev_state or 'UNKNOWN'} → <b>{curr_state}</b>")
-                state.setdefault("_trend1d_state", {})[sym] = curr_state
-                if curr_state == "UP":
-                    send_telegram(f"🧭 {sym}: Trend 1D <b>BULLISH</b>. Holder: attendi pullback 1H (RSI<30 + MACD ↑) o valuta 🟡 OPPORTUNITY.")
+            if rowD is not None:
+                curr_state = trend_state_from_row(rowD)
+                prev_state = state.get("_trend1d_state", {}).get(sym)
+                if curr_state != prev_state:
+                    send_telegram(f"📈 <b>{sym}</b> Trend 1D cambiato: {prev_state or 'UNKNOWN'} → <b>{curr_state}</b>")
+                    state.setdefault("_trend1d_state", {})[sym] = curr_state
+                    if curr_state == "UP":
+                        send_telegram(f"🧭 {sym}: Trend 1D <b>BULLISH</b>. Holder: attendi pullback 1H (RSI<30 + MACD ↑) o valuta 🟡 OPPORTUNITY.")
 
             # --- Trend 4H opzionale ---
             if ENABLE_4H_TREND_ALERTS:

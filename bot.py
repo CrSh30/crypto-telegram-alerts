@@ -108,6 +108,7 @@ def fetch_bybit(sym, limit, interval):
     return pd.DataFrame(rows).sort_values("close_time")
 
 def fetch_bitget_spot(sym, limit, granularity="1h"):
+    granularity = granularity.lower()  # normalizza sempre
     # Bitget SPOT v2 (candles + history-candles fallback)
     urls = [
         ("https://api.bitget.com/api/v2/spot/market/candles",
@@ -169,7 +170,7 @@ def fetch_ohlc_1d(sym):
             print(sym, "Bybit 1D fail:", e)
     if bg:
         try:
-            return fetch_bitget_spot(bg, CANDLES_1D, "1D")
+            return fetch_bitget_spot(bg, CANDLES_1D, "1d")
         except Exception as e:
             print(sym, "Bitget 1D fail:", e)
     raise RuntimeError("no 1D data for " + sym)

@@ -218,12 +218,46 @@ def resample_to_4h(df_1h: pd.DataFrame) -> pd.DataFrame:
 # ========= TECHNICALS =========
 
 def add_indicators(df):
-    if df is None or len(df) == 0:
-        raise RuntimeError("add_indicators: df is None or empty")
-    df["rsi"] = ta.rsi(df["close"], length=14)
-    macd = ta.macd(df["close"], fast=MACD_FAST, slow=MACD_SLOW, signal=MACD_SIGNAL)
-    df["macd"], df["macd_signal"] = macd["MACD_12_26_9"], macd["MACDs_12_26_9"]
-    df["macd_hist"] = df["macd"] - df["macd_signal"]
+    """Aggiunge RSI e MACD in modo robusto (anche se dati scarsi o sporchi)."""
+    if df is None or len(df) < 30:
+        # troppo pochi dati per calcolare indicatori
+        print("⚠️ add_indicators: dataframe vuoto o troppo corto (len =", len(df) if df is not None else "None", ")")
+        return df
+
+    # Assicura che non ci siano duplicati e indici inconsistenti
+    df = df.copy()
+    if "close_time" in df:
+        df = df.sort_values("close_time").drop_duplicates(subset="close_time")
+
+    try:
+        df["rsi"] = ta.rsi(df["close"], length=14)
+    except Exception as e:
+        print("⚠️ add_indicators RSI error:", e)
+        df["rsi"] = None
+
+    try:
+        macd = ta.macd(df["close"], fast=MACD_FAST, slow=MACD_SLOW, signal=MACD_SIGNAL)
+        if macd is not None and "MACD_12_26_9" in macd:
+            df["macd"] = macd["MACD_12_26_9"]
+            df["macd_signal"] = macd["MACDs_12_26_9"]
+        else:
+            # fallback: colonne vuote
+            df["macd"], df["macd_signal"] = None, None
+            print("⚠️ add_indicators: MACD returned None or missing columns")
+    except Exception as e:
+        print("⚠️ add_indicators MACD error:", e)
+        df["macd"], df["macd_signal"] = None, None
+
+    # calcola istogramma solo se valori validi
+    try:
+        if "macd" in df and "macd_signal" in df:
+            df["macd_hist"] = df["macd"] - df["macd_signal"]
+        else:
+            df["macd_hist"] = None
+    except Exception as e:
+        print("⚠️ add_indicators hist error:", e)
+        df["macd_hist"] = None
+
     return df
 
 def last_closed_rows(df):

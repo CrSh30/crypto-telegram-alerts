@@ -218,6 +218,8 @@ def resample_to_4h(df_1h: pd.DataFrame) -> pd.DataFrame:
 # ========= TECHNICALS =========
 
 def add_indicators(df):
+    if df is None or len(df) == 0:
+        raise RuntimeError("add_indicators: df is None or empty")
     df["rsi"] = ta.rsi(df["close"], length=14)
     macd = ta.macd(df["close"], fast=MACD_FAST, slow=MACD_SLOW, signal=MACD_SIGNAL)
     df["macd"], df["macd_signal"] = macd["MACD_12_26_9"], macd["MACDs_12_26_9"]
@@ -349,35 +351,53 @@ def run_once():
     # === Loop per coin ===
     for sym in COINS.keys():
         try:
-            # 1H
-            df1 = add_indicators(fetch_ohlc_1h(sym))
-            row1, prev1 = last_closed_rows(df1)
-            if row1 is None:
-                print(sym, "skip: no 1H last closed")
+            # --- 1H fetch sicuro ---
+            df1_raw = None
+            try:
+                df1_raw = fetch_ohlc_1h(sym)
+            except Exception as fe:
+                print(sym, "1H fetch fail:", fe)
+                df1_raw = None
+
+            if df1_raw is None or len(df1_raw) < 3:
+                print(sym, "skip: no 1H data (raw is None or too short)")
                 continue
 
-            # 1D (filtro macro) — robusto a None
-            try:
-                dfD = add_indicators(fetch_ohlc_1d(sym))
-                rowD, prevD = last_closed_rows(dfD)
-            except Exception as e:
-                print(sym, "1D fetch/add_indicators fail:", e)
-                rowD, prevD = None, None
+            df1 = add_indicators(df1_raw)
+            row1, prev1 = last_closed_rows(df1)
+            if row1 is None:
+                print(sym, "skip: no 1H last closed after indicators")
+                continue
 
-            if rowD is None:
-                print(sym, "skip: no 1D last closed")
-                macdD = sigD = None
-                trend_up = False
+            # --- 1D fetch sicuro (filtro macro) ---
+            dfD_raw = None
+            try:
+                dfD_raw = fetch_ohlc_1d(sym)
+            except Exception as feD:
+                print(sym, "1D fetch fail:", feD)
+                dfD_raw = None
+
+            rowD = prevD = None
+            trend_up = False
+            macdD = sigD = None
+
+            if dfD_raw is None or len(dfD_raw) < 3:
+                print(sym, "skip: no 1D data (raw is None or too short)")
             else:
-                macdD = safe_get(rowD, "macd")
-                sigD  = safe_get(rowD, "macd_signal")
-                trend_up = notna_all(macdD, sigD) and (macdD > sigD)
+                dfD = add_indicators(dfD_raw)
+                rowD, prevD = last_closed_rows(dfD)
+                if rowD is None:
+                    print(sym, "skip: no 1D last closed after indicators")
+                else:
+                    macdD = safe_get(rowD, "macd")
+                    sigD  = safe_get(rowD, "macd_signal")
+                    trend_up = notna_all(macdD, sigD) and (macdD > sigD)
 
             # --- BUY ---
             if trend_up and notna_all(safe_get(prev1, "rsi"), safe_get(row1, "rsi"),
                                       safe_get(prev1, "macd"), safe_get(prev1, "macd_signal"),
                                       safe_get(row1, "macd"), safe_get(row1, "macd_signal")):
-                rsi_cross = (safe_get(prev1, "rsi") >= RSI_LOW) and (safe_get(row1, "rsi") < RSI_LOW)
+                rsi_cross  = (safe_get(prev1, "rsi") >= RSI_LOW) and (safe_get(row1, "rsi") < RSI_LOW)
                 macd_cross = (safe_get(prev1, "macd") <= safe_get(prev1, "macd_signal")) and (safe_get(row1, "macd") > safe_get(row1, "macd_signal"))
                 if rsi_cross and macd_cross and cooldown_ok(state, sym, "buy_combo", COOLDOWN_HOURS):
                     msgs.append(
@@ -390,7 +410,7 @@ def run_once():
             # --- OPPORTUNITY (wide) ---
             if ENABLE_OPPORTUNITY and trend_up and notna_all(safe_get(row1,"rsi"), safe_get(row1,"macd"),
                                                              safe_get(row1,"macd_signal"), safe_get(row1,"macd_hist")):
-                rsi_ok = (safe_get(row1, "rsi") < RSI_WIDE)
+                rsi_ok  = (safe_get(row1, "rsi") < RSI_WIDE)
                 macd_ok = (safe_get(row1, "macd") > safe_get(row1, "macd_signal"))
 
                 # istogramma in miglioramento 3 barre

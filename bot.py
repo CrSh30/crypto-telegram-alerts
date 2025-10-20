@@ -1,3 +1,5 @@
+# bot.py — full patched version
+
 import os
 import json
 import requests
@@ -7,13 +9,15 @@ from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-# ===== CONFIG =====
+# ========= CONFIG =========
+
+# Symbols mapping: (OKX instId, Bybit symbol, Bitget spot symbol)
 COINS = {
-    "BTC": ("BTC-USDT", "BTC-USDT", "BTCUSDT", None),
-    "ETH": ("ETH-USDT", "ETH-USDT", "ETHUSDT", None),
-    "BNB": ("BNB-USDT", "BNB-USDT", "BNBUSDT", None),
-    "SOL": ("SOL-USDT", "SOL-USDT", "SOLUSDT", None),
-    "BGB": (None, None, None, "BGBUSDT"),
+    "BTC": ("BTC-USDT", "BTCUSDT", None),   # Bitget not needed (OKX/Bybit ok)
+    "ETH": ("ETH-USDT", "ETHUSDT", None),
+    "BNB": ("BNB-USDT", "BNBUSDT", None),
+    "SOL": ("SOL-USDT", "SOLUSDT", None),
+    "BGB": (None, None, "BGBUSDT"),         # BGB via Bitget spot
 }
 
 CANDLES_1H = 240
@@ -24,22 +28,25 @@ RSI_LOW = 30
 MACD_FAST, MACD_SLOW, MACD_SIGNAL = 12, 26, 9
 COOLDOWN_HOURS = 6
 
-# OPPORTUNITY (più largo) — può essere controllato via GitHub Secret
+# OPPORTUNITY (wide) — controllabile via ENV
 ENABLE_OPPORTUNITY = os.getenv("ENABLE_OPPORTUNITY", "1") == "1"
 RSI_WIDE = int(os.getenv("RSI_WIDE", "40"))
 OPPORTUNITY_COOLDOWN_HOURS = int(os.getenv("OPPORTUNITY_COOLDOWN_HOURS", "3"))
 
-# Trend-change 4H opzionale (resta com'era)
+# Trend 4H opzionale
 ENABLE_4H_TREND_ALERTS = True
 TREND4H_COOLDOWN_HOURS = 6
 
+# Telegram
 TG_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TG_CHAT  = os.getenv("TELEGRAM_CHAT_ID")
 
+# Stato su filesystem (cache persistita via Actions Cache)
 STATE_DIR  = Path(".state")
 STATE_FILE = STATE_DIR / "last_signals.json"
 
-# ===== UTILITIES =====
+# ========= UTILS =========
+
 def notna_all(*vals) -> bool:
     for v in vals:
         if v is None or pd.isna(v):
@@ -60,7 +67,26 @@ def send_telegram(msg: str):
     except Exception as e:
         print("Telegram exc:", e)
 
-# ===== FETCHERS =====
+def pct(a, b):
+    """Percent change a vs b (b!=0)."""
+    try:
+        a = float(a); b = float(b)
+        return (a - b) / b * 100.0 if b != 0 else 0.0
+    except Exception:
+        return 0.0
+
+def macd_delta_pct(macd_val, sig_val):
+    """MACDΔ% = (MACD - Signal) / |Signal| * 100."""
+    try:
+        macd_val = float(macd_val); sig_val = float(sig_val)
+        if sig_val == 0:
+            return 0.0
+        return (macd_val - sig_val) / abs(sig_val) * 100.0
+    except Exception:
+        return 0.0
+
+# ========= FETCHERS =========
+
 def fetch_okx(inst, limit, bar):
     r = requests.get("https://www.okx.com/api/v5/market/candles",
                      params={"instId": inst, "bar": bar, "limit": limit}, timeout=25)
@@ -81,45 +107,72 @@ def fetch_bybit(sym, limit, interval):
              "close": float(x[4]), "volume": float(x[5])} for x in data]
     return pd.DataFrame(rows).sort_values("close_time")
 
-def fetch_bitget(sym, limit):
+def fetch_bitget_spot(sym, limit, granularity="1h"):
+    # Bitget SPOT v2 (candles + history-candles fallback)
     urls = [
-        ("https://api.bitget.com/api/v2/spot/market/candles", {"symbol": sym, "granularity": "1h", "limit": limit}),
-        ("https://api.bitget.com/api/v2/market/candles", {"symbol": sym, "productType": "spbl", "granularity": "1h", "limit": limit}),
-        ("https://api.bitget.com/api/spot/v1/market/candles", {"symbol": sym, "period": "1H", "limit": limit}),
+        ("https://api.bitget.com/api/v2/spot/market/candles",
+         {"symbol": sym, "granularity": granularity, "limit": limit}),
+        ("https://api.bitget.com/api/v2/spot/market/history-candles",
+         {"symbol": sym, "granularity": granularity, "limit": limit}),
     ]
     for url, p in urls:
         try:
             r = requests.get(url, params=p, timeout=25)
             r.raise_for_status()
             data = r.json().get("data", [])
-            rows = [{"close_time": pd.to_datetime(int(x[0]), unit="ms", utc=True),
-                     "open": float(x[1]), "high": float(x[2]), "low": float(x[3]),
-                     "close": float(x[4]), "volume": float(x[5])} for x in data]
-            if len(rows):
-                return pd.DataFrame(rows).sort_values("close_time")
-        except Exception:
-            continue
-    raise RuntimeError("Bitget no data")
+            if not data:
+                continue
+            rows = [{
+                "close_time": pd.to_datetime(int(x[0]), unit="ms", utc=True),
+                "open": float(x[1]), "high": float(x[2]),
+                "low": float(x[3]), "close": float(x[4]),
+                "volume": float(x[5])
+            } for x in data]
+            df = pd.DataFrame(rows).sort_values("close_time")
+            if not df.empty:
+                return df
+        except Exception as e:
+            print(f"Bitget spot fetch fail ({url}):", e)
+    raise RuntimeError("Bitget spot: no data")
 
 def fetch_ohlc_1h(sym):
-    okx, _, by, bg = COINS[sym]
-    for f, args in [(fetch_okx, (okx, CANDLES_1H, "1H")),
-                    (fetch_bybit, (by, CANDLES_1H, "60")),
-                    (fetch_bitget, (bg, CANDLES_1H))]:
-        if args[0]:
-            try: return f(*args)
-            except Exception as e: print(sym, "1H fail:", e)
-    raise RuntimeError("no 1H data")
+    okx, by, bg = COINS[sym]
+    # preferisci OKX → Bybit → Bitget
+    if okx:
+        try:
+            return fetch_okx(okx, CANDLES_1H, "1H")
+        except Exception as e:
+            print(sym, "OKX 1H fail:", e)
+    if by:
+        try:
+            return fetch_bybit(by, CANDLES_1H, "60")
+        except Exception as e:
+            print(sym, "Bybit 1H fail:", e)
+    if bg:
+        try:
+            return fetch_bitget_spot(bg, CANDLES_1H, "1h")
+        except Exception as e:
+            print(sym, "Bitget 1H fail:", e)
+    raise RuntimeError("no 1H data for " + sym)
 
 def fetch_ohlc_1d(sym):
-    okx, _, by, bg = COINS[sym]
-    for f, args in [(fetch_okx, (okx, CANDLES_1D, "1D")),
-                    (fetch_bybit, (by, CANDLES_1D, "D")),
-                    (fetch_bitget, (bg, CANDLES_1D))]:
-        if args[0]:
-            try: return f(*args)
-            except Exception as e: print(sym, "1D fail:", e)
-    raise RuntimeError("no 1D data")
+    okx, by, bg = COINS[sym]
+    if okx:
+        try:
+            return fetch_okx(okx, CANDLES_1D, "1D")
+        except Exception as e:
+            print(sym, "OKX 1D fail:", e)
+    if by:
+        try:
+            return fetch_bybit(by, CANDLES_1D, "D")
+        except Exception as e:
+            print(sym, "Bybit 1D fail:", e)
+    if bg:
+        try:
+            return fetch_bitget_spot(bg, CANDLES_1D, "1D")
+        except Exception as e:
+            print(sym, "Bitget 1D fail:", e)
+    raise RuntimeError("no 1D data for " + sym)
 
 def resample_to_4h(df_1h: pd.DataFrame) -> pd.DataFrame:
     df = df_1h.copy()
@@ -130,7 +183,8 @@ def resample_to_4h(df_1h: pd.DataFrame) -> pd.DataFrame:
     out = out.rename(columns={"index":"close_time"})
     return out
 
-# ===== TECHNICALS =====
+# ========= TECHNICALS =========
+
 def add_indicators(df):
     df["rsi"] = ta.rsi(df["close"], length=14)
     macd = ta.macd(df["close"], fast=MACD_FAST, slow=MACD_SLOW, signal=MACD_SIGNAL)
@@ -139,77 +193,113 @@ def add_indicators(df):
     return df
 
 def last_closed_rows(df):
-    if len(df) < 3: return None, None
-    return df.iloc[-2], df.iloc[-3]
+    if df is None or len(df) < 3:
+        return None, None
+    return df.iloc[-2], df.iloc[-3]   # penultima = ultima CHIUSA
 
 def trend_state_from_row(row):
-    if notna_all(row["macd"], row["macd_signal"]):
+    if notna_all(row.get("macd"), row.get("macd_signal")):
         if abs(row["macd"] - row["macd_signal"]) < 1e-12:
             return "NEUTRAL"
         return "UP" if row["macd"] > row["macd_signal"] else "DOWN"
     return "NEUTRAL"
 
-# ===== STATE =====
+# ========= STATE =========
+
 def load_state():
     try:
-        if STATE_FILE.exists(): return json.load(open(STATE_FILE))
-    except: pass
+        if STATE_FILE.exists():
+            return json.load(open(STATE_FILE))
+    except:
+        pass
     return {}
+
 def save_state(s):
     STATE_DIR.mkdir(exist_ok=True)
-    json.dump(s, open(STATE_FILE,"w"))
-def cooldown_ok(s,c,k,h):
-    now=datetime.now(timezone.utc)
-    last=s.get(c,{}).get(k)
-    if not last: return True
-    try:last=datetime.fromisoformat(last)
-    except:return True
-    return now-last>=timedelta(hours=h)
-def mark_sent(s,c,k): s.setdefault(c,{})[k]=datetime.now(timezone.utc).isoformat()
+    json.dump(s, open(STATE_FILE, "w"))
 
-# ===== REPORT 1D (percentuale) =====
+def cooldown_ok(s, c, k, h):
+    now = datetime.now(timezone.utc)
+    last = s.get(c, {}).get(k)
+    if not last:
+        return True
+    try:
+        last = datetime.fromisoformat(last)
+    except:
+        return True
+    return now - last >= timedelta(hours=h)
+
+def mark_sent(s, c, k):
+    s.setdefault(c, {})[k] = datetime.now(timezone.utc).isoformat()
+
+# ========= DAILY REPORT (MACDΔ% + PriceΔ%) =========
+
 def build_daily_trend_report():
-    lines=[]
+    """
+    Riepilogo 1D per ogni coin:
+    - freccia (trend 1D via MACD vs Signal)
+    - MACDΔ%  (forza/momentum 1D)
+    - PriceΔ% (close 1D vs close 1D precedente)
+    """
+    parts = []
     for sym in COINS.keys():
         try:
-            dfD=add_indicators(fetch_ohlc_1d(sym))
-            rowD,_=last_closed_rows(dfD)
-            if rowD is None:
-                lines.append(f"{sym} ?"); continue
-            arrow="?"
-            strength=""
-            if notna_all(rowD["macd"], rowD["macd_signal"], rowD["close"]):
-                delta=rowD["macd"]-rowD["macd_signal"]
-                pct=(delta/max(abs(rowD["close"]),1e-9))*100
-                arrow="→" if abs(delta)<1e-12 else ("↑" if delta>0 else "↓")
-                strength=f" ({pct:+.2f}%)"
-            lines.append(f"{sym} {arrow}{strength}")
-        except: lines.append(f"{sym} ?")
-    return " ".join(lines)
+            dfD = add_indicators(fetch_ohlc_1d(sym))
+            if dfD is None or len(dfD) < 3:
+                parts.append(f"{sym} ?")
+                continue
 
-# ===== DAILY WINDOW CONTROL =====
-def now_rome(): return datetime.now(ZoneInfo("Europe/Rome"))
+            last = dfD.iloc[-2]   # ultima 1D chiusa
+            prev = dfD.iloc[-3]
+
+            trend_up = notna_all(last.get("macd"), last.get("macd_signal")) and last["macd"] > last["macd_signal"]
+            arrow = "↑" if trend_up else "↓"
+
+            mdp = macd_delta_pct(last.get("macd"), last.get("macd_signal"))
+            price_pct = pct(float(last["close"]), float(prev["close"]))
+
+            parts.append(f"{sym} {arrow} MACDΔ {mdp:+.2f}% | PriceΔ {price_pct:+.2f}%")
+
+        except Exception as e:
+            print(f"[DAILY] {sym} build err:", e)
+            parts.append(f"{sym} err")
+
+    line = "  ".join(parts)
+    if len(line) > 180:
+        mid = len(parts)//2
+        line = "\n" + "  ".join(parts[:mid]) + "\n" + "  ".join(parts[mid:])
+    return line
+
+# ========= DAILY / HEARTBEAT WINDOW (robusto) =========
+
+def now_rome():
+    return datetime.now(ZoneInfo("Europe/Rome"))
+
 def should_send_daily_report(state):
     n = now_rome()
     # Invia UNA SOLA VOLTA al giorno, alla prima run dopo le 08:00 Europe/Rome
-    # Se il runner parte in ritardo (08:18 / 09:02), la manda comunque.
     if str(n.date()) == str(state.get("_daily_report_date")):
         return False
-    return (n.hour == 8 and n.minute < 45) or (n.hour > 8)
-def mark_daily_report_sent(state): state["_daily_report_date"]=str(now_rome().date())
+    return n.hour >= 8
+
+def mark_daily_report_sent(state):
+    state["_daily_report_date"] = str(now_rome().date())
+
 def should_send_heartbeat(state):
     n = now_rome()
     if str(n.date()) == str(state.get("_heartbeat_date")):
         return False
-    return (n.hour == 8 and n.minute < 45) or (n.hour > 8)
-def mark_heartbeat_sent(state): state["_heartbeat_date"]=str(now_rome().date())
+    return n.hour >= 8
 
-# ===== MAIN =====
+def mark_heartbeat_sent(state):
+    state["_heartbeat_date"] = str(now_rome().date())
+
+# ========= MAIN =========
+
 def run_once():
-    # Carica stato
     state = load_state()
 
-    # --- Sync logs: orari e stato daily/heartbeat (solo log, non blocca nulla)
+    # --- Sync logs ---
     try:
         utc_now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
         rome_now = now_rome().strftime("%Y-%m-%d %H:%M:%S Europe/Rome")
@@ -221,7 +311,7 @@ def run_once():
 
     msgs = []
 
-    # === LOOP COIN PRINCIPALE ===
+    # === Loop per coin ===
     for sym in COINS.keys():
         try:
             # 1H
@@ -235,7 +325,7 @@ def run_once():
             rowD, prevD = last_closed_rows(dfD)
             trend_up = notna_all(rowD["macd"], rowD["macd_signal"]) and (rowD["macd"] > rowD["macd_signal"])
 
-            # --- BUY (conservativo) ---
+            # --- BUY ---
             if trend_up and notna_all(prev1["rsi"], row1["rsi"], prev1["macd"], prev1["macd_signal"], row1["macd"], row1["macd_signal"]):
                 rsi_cross = (prev1["rsi"] >= RSI_LOW) and (row1["rsi"] < RSI_LOW)
                 macd_cross = (prev1["macd"] <= prev1["macd_signal"]) and (row1["macd"] > row1["macd_signal"])
@@ -247,12 +337,12 @@ def run_once():
                     )
                     mark_sent(state, sym, "buy_combo")
 
-            # --- OPPORTUNITY (più largo) ---
+            # --- OPPORTUNITY (wide) ---
             if ENABLE_OPPORTUNITY and trend_up and notna_all(row1["rsi"], row1["macd"], row1["macd_signal"], row1["macd_hist"]):
                 rsi_ok = (row1["rsi"] < RSI_WIDE)
                 macd_ok = (row1["macd"] > row1["macd_signal"])
 
-                # Istogramma MACD in miglioramento da 3 barre
+                # istogramma in miglioramento 3 barre
                 hist_ok = False
                 if prev1 is not None and len(df1) >= 4:
                     h_1 = df1["macd_hist"].iloc[-2]
@@ -272,16 +362,16 @@ def run_once():
                     )
                     mark_sent(state, sym, "opp_alert")
 
-            # --- TREND CHANGE 1D ---
+            # --- Trend change 1D ---
             curr_state = trend_state_from_row(rowD)
             prev_state = state.get("_trend1d_state", {}).get(sym)
             if curr_state != prev_state:
                 send_telegram(f"📈 <b>{sym}</b> Trend 1D cambiato: {prev_state or 'UNKNOWN'} → <b>{curr_state}</b>")
                 state.setdefault("_trend1d_state", {})[sym] = curr_state
                 if curr_state == "UP":
-                    send_telegram(f"🧭 {sym}: Trend 1D <b>BULLISH</b>. Strategia holder: attendi pullback 1H (RSI<30 + MACD ↑) o valuta 🟡 OPPORTUNITY.")
+                    send_telegram(f"🧭 {sym}: Trend 1D <b>BULLISH</b>. Holder: attendi pullback 1H (RSI<30 + MACD ↑) o valuta 🟡 OPPORTUNITY.")
 
-            # --- TREND 4H opzionale ---
+            # --- Trend 4H opzionale ---
             if ENABLE_4H_TREND_ALERTS:
                 df4 = add_indicators(resample_to_4h(df1))
                 row4, prev4 = last_closed_rows(df4)
@@ -296,13 +386,13 @@ def run_once():
         except Exception as e:
             print(sym, "errore:", e)
 
-    # Invio batch BUY (se ci sono)
+    # Invio batch BUY (se presenti)
     if msgs:
         send_telegram("📣 <b>Crypto BUY Alerts (Holder)</b>\n" + "\n\n".join(msgs))
     else:
         print("Nessun BUY valido (filtrato da trend 1D / cooldown).")
 
-    # --- DAILY / HEARTBEAT robusti ai ritardi
+    # --- Daily & Heartbeat (robusti ai ritardi) ---
     try:
         will_daily = should_send_daily_report(state)
         will_hb = should_send_heartbeat(state)
@@ -310,7 +400,7 @@ def run_once():
 
         if will_daily:
             summary = build_daily_trend_report()
-            send_telegram(f"🗞️ <b>Daily Trend 1D</b>\n{summary}")
+            send_telegram("🗞️ <b>Daily Trend 1D</b>  <i>(MACDΔ% & PriceΔ%)</i>\n" + summary)
             mark_daily_report_sent(state)
 
         if will_hb:
@@ -319,8 +409,7 @@ def run_once():
     except Exception as e:
         print("Daily/Heartbeat error:", e)
 
-    # Salva stato a fine run (sempre dentro run_once)
     save_state(state)
-    
-if __name__=="__main__":
+
+if __name__ == "__main__":
     run_once()

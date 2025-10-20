@@ -108,13 +108,21 @@ def fetch_bybit(sym, limit, interval):
     return pd.DataFrame(rows).sort_values("close_time")
 
 def fetch_bitget_spot(sym, limit, granularity="1h"):
-    granularity = granularity.lower()  # normalizza sempre
-    # Bitget SPOT v2 (candles + history-candles fallback)
+    # Normalizza per lo spot v2:
+    #  - 1h OK
+    #  - daily deve essere "1day" (non 1D/1d)
+    #  - limit consigliato <= 100
+    g = granularity.lower()
+    if g in ("1d","1day","day","d"):
+        g = "1day"
+    if limit > 100:
+        limit = 100
     urls = [
         ("https://api.bitget.com/api/v2/spot/market/candles",
-         {"symbol": sym, "granularity": granularity, "limit": limit}),
+         {"symbol": sym, "granularity": g, "limit": limit}),
+        # fallback SOLO se serve e con endTime obbligatorio
         ("https://api.bitget.com/api/v2/spot/market/history-candles",
-         {"symbol": sym, "granularity": granularity, "limit": limit}),
+         {"symbol": sym, "granularity": g, "limit": limit, "endTime": int(datetime.now(timezone.utc).timestamp()*1000)}),
     ]
     for url, p in urls:
         try:
@@ -127,7 +135,7 @@ def fetch_bitget_spot(sym, limit, granularity="1h"):
                 "close_time": pd.to_datetime(int(x[0]), unit="ms", utc=True),
                 "open": float(x[1]), "high": float(x[2]),
                 "low": float(x[3]), "close": float(x[4]),
-                "volume": float(x[5])
+                "volume": float(x[5]),
             } for x in data]
             df = pd.DataFrame(rows).sort_values("close_time")
             if not df.empty:
@@ -170,7 +178,8 @@ def fetch_ohlc_1d(sym):
             print(sym, "Bybit 1D fail:", e)
     if bg:
         try:
-            return fetch_bitget_spot(bg, CANDLES_1D, "1d")
+            # Bitget spot daily = "1day" e limit <= 100
+            return fetch_bitget_spot(bg, min(CANDLES_1D, 100), "1day")
         except Exception as e:
             print(sym, "Bitget 1D fail:", e)
     raise RuntimeError("no 1D data for " + sym)

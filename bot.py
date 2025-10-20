@@ -456,6 +456,10 @@ def run_once():
                         mark_sent(state, sym, "trend4h_alert")
 
         except Exception as e:
+            import traceback
+            print(f"\n--- DEBUG TRACE for {sym} ---")
+            traceback.print_exc()
+            print("--- END TRACE ---\n")
             print(sym, "errore:", e)
 
     # Invio batch BUY (se presenti)

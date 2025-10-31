@@ -1,4 +1,4 @@
-# bot.py — main (fully patched, robust to missing 1D rows)
+# bot.py — main (tabella daily + news intraday + robust fetch)
 
 import os
 import json
@@ -26,9 +26,9 @@ CANDLES_1D = 400
 # BUY (conservativo)
 RSI_LOW = 30
 MACD_FAST, MACD_SLOW, MACD_SIGNAL = 12, 26, 9
-COOLDOWN_HOURS = 6
+COOLDOWN_HOURS = int(os.getenv("COOLDOWN_HOURS", "6"))
 
-# OPPORTUNITY (wide) — controllabile via ENV
+# OPPORTUNITY (wide) — controllabili via ENV
 ENABLE_OPPORTUNITY = os.getenv("ENABLE_OPPORTUNITY", "1") == "1"
 RSI_WIDE = int(os.getenv("RSI_WIDE", "40"))
 OPPORTUNITY_COOLDOWN_HOURS = int(os.getenv("OPPORTUNITY_COOLDOWN_HOURS", "3"))
@@ -41,9 +41,16 @@ TREND4H_COOLDOWN_HOURS = 6
 TG_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TG_CHAT  = os.getenv("TELEGRAM_CHAT_ID")
 
-# Stato su filesystem (cache persistita via Actions Cache)
+# Stato su filesystem per Actions Cache
 STATE_DIR  = Path(".state")
 STATE_FILE = STATE_DIR / "last_signals.json"
+
+# === NEWS / HEADLINES ===
+ENABLE_NEWS = os.getenv("ENABLE_NEWS", "1") == "1"           # 0 per disattivare
+NEWS_INTRADAY = os.getenv("NEWS_INTRADAY", "1") == "1"       # 1 = anche durante la giornata
+CRYPTOPANIC_TOKEN = os.getenv("CRYPTOPANIC_TOKEN")           # secret
+NEWS_MOVE_PCT = float(os.getenv("NEWS_MOVE_PCT", "3.0"))     # soglia PriceΔ% 1D
+NEWS_COOLDOWN_HOURS = int(os.getenv("NEWS_COOLDOWN_HOURS", "6"))
 
 # ========= UTILS =========
 
@@ -54,7 +61,6 @@ def notna_all(*vals) -> bool:
     return True
 
 def safe_get(row, key, default=None):
-    """Legge 'key' da una pandas Series o dict. Se row è None o manca la chiave, ritorna default."""
     if row is None:
         return default
     try:
@@ -82,7 +88,6 @@ def send_telegram(msg: str):
         print("Telegram exc:", e)
 
 def pct(a, b):
-    """Percent change a vs b (b!=0)."""
     try:
         a = float(a); b = float(b)
         return (a - b) / b * 100.0 if b != 0 else 0.0
@@ -90,7 +95,6 @@ def pct(a, b):
         return 0.0
 
 def macd_delta_pct(macd_val, sig_val):
-    """MACDΔ% = (MACD - Signal) / |Signal| * 100."""
     try:
         macd_val = float(macd_val); sig_val = float(sig_val)
         if sig_val == 0:
@@ -122,24 +126,20 @@ def fetch_bybit(sym, limit, interval):
     return pd.DataFrame(rows).sort_values("close_time")
 
 def fetch_bitget_spot(sym, limit, granularity="1h"):
-    # Normalizza granularity per Spot v2:
     g = (granularity or "").lower().strip()
     if g in ("1d", "day", "d"):
         g = "1day"
     if g == "1":
-        g = "1h"  # safety
+        g = "1h"
 
-    # Bitget spot v2: limit consigliato <= 100
     if limit is None or limit <= 0:
         limit = 100
     else:
         limit = min(int(limit), 100)
 
     urls = [
-        # Primo tentativo: candles (senza endTime)
         ("https://api.bitget.com/api/v2/spot/market/candles",
          {"symbol": sym, "granularity": g, "limit": limit}),
-        # Fallback: history-candles (richiede endTime)
         ("https://api.bitget.com/api/v2/spot/market/history-candles",
          {"symbol": sym, "granularity": g, "limit": limit,
           "endTime": int(datetime.now(timezone.utc).timestamp() * 1000)}),
@@ -167,7 +167,6 @@ def fetch_bitget_spot(sym, limit, granularity="1h"):
 
 def fetch_ohlc_1h(sym):
     okx, by, bg = COINS[sym]
-    # preferisci OKX → Bybit → Bitget
     if okx:
         try:
             return fetch_okx(okx, CANDLES_1H, "1H")
@@ -199,7 +198,6 @@ def fetch_ohlc_1d(sym):
             print(sym, "Bybit 1D fail:", e)
     if bg:
         try:
-            # Bitget spot daily: "1day" e limit <= 100
             return fetch_bitget_spot(bg, min(CANDLES_1D, 100), "1day")
         except Exception as e:
             print(sym, "Bitget 1D fail:", e)
@@ -209,8 +207,8 @@ def fetch_ohlc_1d(sym):
 def resample_to_4h(df_1h: pd.DataFrame) -> pd.DataFrame:
     df = df_1h.copy()
     df = df.set_index(pd.to_datetime(df["close_time"], utc=True)).sort_index()
-    ohlc = df["close"].resample("4H", label="right", closed="right").ohlc()
-    vol = df["volume"].resample("4H", label="right", closed="right").sum()
+    ohlc = df["close"].resample("4h", label="right", closed="right").ohlc()
+    vol  = df["volume"].resample("4h", label="right", closed="right").sum()
     out = pd.concat([ohlc, vol], axis=1).dropna().reset_index()
     out = out.rename(columns={"index":"close_time"})
     return out
@@ -218,13 +216,10 @@ def resample_to_4h(df_1h: pd.DataFrame) -> pd.DataFrame:
 # ========= TECHNICALS =========
 
 def add_indicators(df):
-    """Aggiunge RSI e MACD in modo robusto (anche se dati scarsi o sporchi)."""
     if df is None or len(df) < 30:
-        # troppo pochi dati per calcolare indicatori
         print("⚠️ add_indicators: dataframe vuoto o troppo corto (len =", len(df) if df is not None else "None", ")")
         return df
 
-    # Assicura che non ci siano duplicati e indici inconsistenti
     df = df.copy()
     if "close_time" in df:
         df = df.sort_values("close_time").drop_duplicates(subset="close_time")
@@ -241,14 +236,12 @@ def add_indicators(df):
             df["macd"] = macd["MACD_12_26_9"]
             df["macd_signal"] = macd["MACDs_12_26_9"]
         else:
-            # fallback: colonne vuote
             df["macd"], df["macd_signal"] = None, None
             print("⚠️ add_indicators: MACD returned None or missing columns")
     except Exception as e:
         print("⚠️ add_indicators MACD error:", e)
         df["macd"], df["macd_signal"] = None, None
 
-    # calcola istogramma solo se valori validi
     try:
         if "macd" in df and "macd_signal" in df:
             df["macd_hist"] = df["macd"] - df["macd_signal"]
@@ -263,7 +256,7 @@ def add_indicators(df):
 def last_closed_rows(df):
     if df is None or len(df) < 3:
         return None, None
-    return df.iloc[-2], df.iloc[-3]   # penultima = ultima CHIUSA
+    return df.iloc[-2], df.iloc[-3]
 
 def trend_state_from_row(row):
     if row is None:
@@ -304,45 +297,111 @@ def cooldown_ok(s, c, k, h):
 def mark_sent(s, c, k):
     s.setdefault(c, {})[k] = datetime.now(timezone.utc).isoformat()
 
-# ========= DAILY REPORT (MACDΔ% + PriceΔ%) =========
+# ========= DAILY REPORT TABELLARE =========
 
 def build_daily_trend_report():
-    """
-    Riepilogo 1D per ogni coin:
-    - freccia (trend 1D via MACD vs Signal)
-    - MACDΔ%  (forza/momentum 1D)
-    - PriceΔ% (close 1D vs close 1D precedente)
-    """
-    parts = []
+    rows = []
     for sym in COINS.keys():
         try:
             dfD = add_indicators(fetch_ohlc_1d(sym))
             if dfD is None or len(dfD) < 3:
-                parts.append(f"{sym} ?")
+                rows.append((sym, "?", 0.0, 0.0))
                 continue
 
-            last = dfD.iloc[-2]   # ultima 1D chiusa
+            last = dfD.iloc[-2]
             prev = dfD.iloc[-3]
 
-            trend_up = notna_all(safe_get(last, "macd"), safe_get(last, "macd_signal")) and safe_get(last, "macd") > safe_get(last, "macd_signal")
+            macd = safe_get(last, "macd"); sig = safe_get(last, "macd_signal")
+            trend_up = notna_all(macd, sig) and macd > sig
             arrow = "↑" if trend_up else "↓"
 
-            mdp = macd_delta_pct(safe_get(last, "macd"), safe_get(last, "macd_signal"))
+            mdp = macd_delta_pct(macd, sig)
             price_pct = pct(float(safe_get(last, "close")), float(safe_get(prev, "close")))
 
-            parts.append(f"{sym} {arrow} MACDΔ {mdp:+.2f}% | PriceΔ {price_pct:+.2f}%")
-
+            rows.append((sym, arrow, mdp, price_pct))
         except Exception as e:
             print(f"[DAILY] {sym} build err:", e)
-            parts.append(f"{sym} err")
+            rows.append((sym, "?", 0.0, 0.0))
 
-    line = "  ".join(parts)
-    if len(line) > 180:
-        mid = len(parts)//2
-        line = "\n" + "  ".join(parts[:mid]) + "\n" + "  ".join(parts[mid:])
-    return line
+    header = ["COIN", "TREND", "MACDΔ%", "PriceΔ%"]
+    data = []
+    for sym, arrow, mdp, price_pct in rows:
+        data.append([sym, arrow, f"{mdp:+.2f}%", f"{price_pct:+.2f}%"])
 
-# ========= DAILY / HEARTBEAT WINDOW (robusto) =========
+    cols = list(zip(*([header] + data)))
+    widths = [max(len(str(x)) for x in col) for col in cols]
+
+    def fmt(row):
+        return "  ".join(str(val).rjust(w) for val, w in zip(row, widths))
+
+    lines = [fmt(header), fmt(["-"*w for w in widths])]
+    for r in data:
+        lines.append(fmt(r))
+
+    table = "\n".join(lines)
+    return f"<pre>{table}</pre>"
+
+# ========= NEWS =========
+
+def cryptopanic_news(symbol, limit=2):
+    if not CRYPTOPANIC_TOKEN:
+        return []
+    cur = symbol.upper()
+    try:
+        r = requests.get(
+            "https://cryptopanic.com/api/v1/posts/",
+            params={
+                "auth_token": CRYPTOPANIC_TOKEN,
+                "currencies": cur,
+                "kind": "news",
+                "filter": "hot",
+                "public": "true",
+                "regions": "en",
+            },
+            timeout=20
+        )
+        r.raise_for_status()
+        data = r.json().get("results", [])
+        out = []
+        for item in data:
+            title = item.get("title")
+            url = item.get("url") or (item.get("source") or {}).get("domain")
+            if title and url:
+                out.append((title, url))
+            if len(out) >= limit:
+                break
+        return out
+    except Exception as e:
+        print(f"[NEWS] CryptoPanic error for {symbol}:", e)
+        return []
+
+def maybe_send_news_for_moves(state):
+    if not ENABLE_NEWS:
+        return
+    for sym in COINS.keys():
+        try:
+            dfD = add_indicators(fetch_ohlc_1d(sym))
+            if dfD is None or len(dfD) < 3:
+                continue
+            last = dfD.iloc[-2]; prev = dfD.iloc[-3]
+            price_pct = pct(float(safe_get(last, "close")), float(safe_get(prev, "close")))
+            if abs(price_pct) < NEWS_MOVE_PCT:
+                continue
+            if not cooldown_ok(state, sym, "news_alert", NEWS_COOLDOWN_HOURS):
+                continue
+            headlines = cryptopanic_news(sym, limit=2)
+            if headlines:
+                lines = [f"📰 <b>{sym}</b> news (PriceΔ {price_pct:+.2f}% 1D):"]
+                for t, u in headlines:
+                    lines.append(f"• {t}\n  {u}")
+                send_telegram("\n".join(lines))
+                mark_sent(state, sym, "news_alert")
+            else:
+                print(f"[NEWS] No headlines for {sym} (PriceΔ {price_pct:+.2f}%).")
+        except Exception as e:
+            print(f"[NEWS] {sym} err:", e)
+
+# ========= DAILY / HEARTBEAT =========
 
 def now_rome():
     return datetime.now(ZoneInfo("Europe/Rome"))
@@ -370,7 +429,6 @@ def mark_heartbeat_sent(state):
 def run_once():
     state = load_state()
 
-    # --- Sync logs ---
     try:
         utc_now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
         rome_now = now_rome().strftime("%Y-%m-%d %H:%M:%S Europe/Rome")
@@ -382,10 +440,8 @@ def run_once():
 
     msgs = []
 
-    # === Loop per coin ===
     for sym in COINS.keys():
         try:
-            # --- 1H fetch sicuro ---
             df1_raw = None
             try:
                 df1_raw = fetch_ohlc_1h(sym)
@@ -403,7 +459,6 @@ def run_once():
                 print(sym, "skip: no 1H last closed after indicators")
                 continue
 
-            # --- 1D fetch sicuro (filtro macro) ---
             dfD_raw = None
             try:
                 dfD_raw = fetch_ohlc_1d(sym)
@@ -427,7 +482,6 @@ def run_once():
                     sigD  = safe_get(rowD, "macd_signal")
                     trend_up = notna_all(macdD, sigD) and (macdD > sigD)
 
-            # --- BUY ---
             if trend_up and notna_all(safe_get(prev1, "rsi"), safe_get(row1, "rsi"),
                                       safe_get(prev1, "macd"), safe_get(prev1, "macd_signal"),
                                       safe_get(row1, "macd"), safe_get(row1, "macd_signal")):
@@ -441,13 +495,11 @@ def run_once():
                     )
                     mark_sent(state, sym, "buy_combo")
 
-            # --- OPPORTUNITY (wide) ---
             if ENABLE_OPPORTUNITY and trend_up and notna_all(safe_get(row1,"rsi"), safe_get(row1,"macd"),
                                                              safe_get(row1,"macd_signal"), safe_get(row1,"macd_hist")):
                 rsi_ok  = (safe_get(row1, "rsi") < RSI_WIDE)
                 macd_ok = (safe_get(row1, "macd") > safe_get(row1, "macd_signal"))
 
-                # istogramma in miglioramento 3 barre
                 hist_ok = False
                 if prev1 is not None and len(df1) >= 4:
                     h_1 = safe_get(df1.iloc[-2], "macd_hist")
@@ -467,7 +519,6 @@ def run_once():
                     )
                     mark_sent(state, sym, "opp_alert")
 
-            # --- Trend change 1D (safe) ---
             if rowD is not None and notna_all(macdD, sigD):
                 curr_state = "UP" if macdD > sigD else ("NEUTRAL" if abs(macdD - sigD) < 1e-12 else "DOWN")
                 prev_state = state.get("_trend1d_state", {}).get(sym)
@@ -477,7 +528,6 @@ def run_once():
                     if curr_state == "UP":
                         send_telegram(f"🧭 {sym}: Trend 1D <b>BULLISH</b>. Holder: attendi pullback 1H (RSI<30 + MACD ↑) o valuta 🟡 OPPORTUNITY.")
 
-            # --- Trend 4H opzionale ---
             if ENABLE_4H_TREND_ALERTS:
                 df4 = add_indicators(resample_to_4h(df1))
                 row4, prev4 = last_closed_rows(df4)
@@ -496,13 +546,11 @@ def run_once():
             print("--- END TRACE ---\n")
             print(sym, "errore:", e)
 
-    # Invio batch BUY (se presenti)
     if msgs:
         send_telegram("📣 <b>Crypto BUY Alerts (Holder)</b>\n" + "\n\n".join(msgs))
     else:
         print("Nessun BUY valido (filtrato da trend 1D / cooldown).")
 
-    # --- Daily & Heartbeat (robusti ai ritardi) ---
     try:
         will_daily = should_send_daily_report(state)
         will_hb = should_send_heartbeat(state)
@@ -512,6 +560,14 @@ def run_once():
             summary = build_daily_trend_report()
             send_telegram("🗞️ <b>Daily Trend 1D</b>  <i>(MACDΔ% & PriceΔ%)</i>\n" + summary)
             mark_daily_report_sent(state)
+
+        # News intraday se flag attivo; altrimenti solo con il Daily
+        if ENABLE_NEWS:
+            if NEWS_INTRADAY:
+                maybe_send_news_for_moves(state)
+            else:
+                if will_daily:
+                    maybe_send_news_for_moves(state)
 
         if will_hb:
             send_telegram("✅ Heartbeat: bot attivo e sincronizzato")

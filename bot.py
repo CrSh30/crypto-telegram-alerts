@@ -1,6 +1,6 @@
 # bot.py
-# Crypto RSI/MACD bot with robust 4H→1H fallback + diagnostics + news + daily table
-# Works on GitHub Actions (requests + pandas only)
+# Crypto RSI/MACD bot with provider rotation (OKX→Bybit→Binance), robust 4H→1H fallback,
+# diagnostics, CryptoPanic news (intraday/daily), safe error handling.
 
 import os, json, time, math, datetime as dt
 from datetime import timezone, timedelta
@@ -35,12 +35,18 @@ TELEGRAM_CHAT = os.getenv("TELEGRAM_CHAT_ID", "")
 STATE_DIR = ".state"
 STATE_FILE = f"{STATE_DIR}/state.json"
 
-# Lookbacks (increase to avoid short DF on Bitget/BGB)
+# Lookbacks
 LOOKBACK_1H = int(os.getenv("LOOKBACK_1H", "900"))   # ~37 days of 1h
 LOOKBACK_1D = int(os.getenv("LOOKBACK_1D", "500"))   # ~1.3 years of 1D
 
 UTC_TZ = timezone.utc
 LOCAL_TZNAME = os.getenv("LOCAL_TZ", "Europe/Rome")
+
+# Fallback 1H flag
+ALLOW_1H_FALLBACK = os.getenv("ALLOW_1H_FALLBACK", "true").lower() == "true"
+
+# Trend filter flag: off / buy_only_up / all_up
+TREND_FILTER = os.getenv("TREND_FILTER", "off").lower()
 
 # -----------------------
 # Utilities
@@ -82,10 +88,62 @@ def pct(a, b):
     return (a/b - 1.0) * 100.0
 
 # -----------------------
-# Data providers
+# Provider helpers (OKX / Bybit / Binance)
 # -----------------------
+OKX_IDS = {"BTC": "BTC-USDT", "ETH": "ETH-USDT", "BNB": "BNB-USDT", "SOL": "SOL-USDT"}
+BYBIT_SYM = {"BTC": "BTCUSDT", "ETH": "ETHUSDT", "BNB": "BNBUSDT", "SOL": "SOLUSDT"}
+
+def df_from_klines(rows, schema="binance"):
+    # rows: list, newest-last or first depending on api. Standardize to newest-last with UTC index.
+    # Binance schema known; OKX/Bybit convert below.
+    if schema == "binance":
+        cols = ["time","o","h","l","c","v","ct","qv","n","tb","qtb","ig"]
+        df = pd.DataFrame(rows, columns=cols)
+        df["time"] = pd.to_datetime(df["time"], unit="ms", utc=True)
+        df["open"] = df["o"].astype(float)
+        df["high"] = df["h"].astype(float)
+        df["low"] = df["l"].astype(float)
+        df["close"] = df["c"].astype(float)
+        df["volume"] = df["v"].astype(float)
+        return df[["time","open","high","low","close","volume"]].set_index("time")
+
+def fetch_okx(inst_id: str, bar: str, limit: int) -> pd.DataFrame:
+    # bar: "1H"/"1D"
+    url = "https://www.okx.com/api/v5/market/candles"
+    params = {"instId": inst_id, "bar": bar, "limit": min(limit, 300)}
+    r = requests.get(url, params=params, timeout=20)
+    r.raise_for_status()
+    j = r.json()
+    data = j.get("data", [])
+    if not data:
+        return pd.DataFrame()
+    # OKX returns newest first: [ts, o,h,l,c, vol, volCcy, volCcyQuote, ...]
+    rows = []
+    for x in data[::-1]:
+        ts, o, h, l, c, vol = int(x[0]), float(x[1]), float(x[2]), float(x[3]), float(x[4]), float(x[5])
+        rows.append([pd.to_datetime(ts, unit="ms", utc=True), o, h, l, c, vol])
+    df = pd.DataFrame(rows, columns=["time","open","high","low","close","volume"]).set_index("time")
+    return df
+
+def fetch_bybit(symbol: str, interval: str, limit: int) -> pd.DataFrame:
+    # category spot
+    url = "https://api.bybit.com/v5/market/kline"
+    params = {"category": "spot", "symbol": symbol, "interval": interval, "limit": min(limit, 1000)}
+    r = requests.get(url, params=params, timeout=20)
+    r.raise_for_status()
+    j = r.json()
+    data = j.get("result", {}).get("list", [])
+    if not data:
+        return pd.DataFrame()
+    # Bybit newest first: [ts, o,h,l,c, vol, ...]
+    rows = []
+    for x in data[::-1]:
+        ts, o, h, l, c, v = int(x[0]), float(x[1]), float(x[2]), float(x[3]), float(x[4]), float(x[5])
+        rows.append([pd.to_datetime(ts, unit="ms", utc=True), o, h, l, c, v])
+    df = pd.DataFrame(rows, columns=["time","open","high","low","close","volume"]).set_index("time")
+    return df
+
 def fetch_binance(symbol: str, interval: str, limit: int) -> pd.DataFrame:
-    # symbol e.g. BTCUSDT, interval '1h' or '1d'
     url = "https://api.binance.com/api/v3/klines"
     params = {"symbol": symbol, "interval": interval, "limit": min(limit, 1000)}
     r = requests.get(url, params=params, timeout=20)
@@ -93,30 +151,19 @@ def fetch_binance(symbol: str, interval: str, limit: int) -> pd.DataFrame:
     data = r.json()
     if not data:
         return pd.DataFrame()
-    cols = ["time","o","h","l","c","v","ct","qv","n","tb","qtb","ig"]
-    df = pd.DataFrame(data, columns=cols)
-    df["time"] = pd.to_datetime(df["time"], unit="ms", utc=True)
-    df["open"] = df["o"].astype(float)
-    df["high"] = df["h"].astype(float)
-    df["low"] = df["l"].astype(float)
-    df["close"] = df["c"].astype(float)
-    df["volume"] = df["v"].astype(float)
-    return df[["time","open","high","low","close","volume"]].set_index("time")
+    return df_from_klines(data, "binance")
 
+# Bitget (BGB only) – v2 requires granularity "1h" or "1day"
 def fetch_bitget_bgb(interval: str, limit: int) -> pd.DataFrame:
-    # Bitget v2 history candles, BGB/USDT
-    gran = {"1h":"1h", "1d":"1d"}[interval]
+    gran = {"1h":"1h", "1d":"1day"}[interval]  # FIX: use 1day for daily
     url = "https://api.bitget.com/api/v2/spot/market/history-candles"
     params = {"symbol":"BGBUSDT", "granularity": gran, "limit": str(min(limit, 400))}
     r = requests.get(url, params=params, timeout=20)
-    if r.status_code != 200:
-        print(f"[BGB] Bitget fetch fail ({url}): {r.status_code} {r.text[:200]}")
-        return pd.DataFrame()
+    r.raise_for_status()
     j = r.json()
     if j.get("code") != "00000" or "data" not in j:
         print(f"[BGB] Bitget unexpected payload: {j}")
         return pd.DataFrame()
-    # Bitget returns newest first, [ts, o, h, l, c, v]
     rows = j["data"][::-1]
     if not rows:
         return pd.DataFrame()
@@ -128,17 +175,50 @@ def fetch_bitget_bgb(interval: str, limit: int) -> pd.DataFrame:
     df = pd.DataFrame(recs, columns=["time","open","high","low","close","volume"]).set_index("time")
     return df
 
+# ---- Unified fetchers with rotation ----
 def fetch_ohlc_1h(symbol: str) -> pd.DataFrame:
     if symbol == "BGB":
-        return fetch_bitget_bgb("1h", LOOKBACK_1H)
-    else:
+        try:
+            return fetch_bitget_bgb("1h", LOOKBACK_1H)
+        except Exception as e:
+            print("BGB 1h fetch error:", e)
+            return pd.DataFrame()
+    # rotation: OKX → Bybit → Binance
+    try:
+        return fetch_okx(OKX_IDS[symbol], "1H", LOOKBACK_1H)
+    except Exception as e:
+        print(symbol, "OKX 1H fail:", e)
+    try:
+        return fetch_bybit(BYBIT_SYM[symbol], "60", LOOKBACK_1H)
+    except Exception as e:
+        print(symbol, "Bybit 1H fail:", e)
+    try:
         return fetch_binance(symbol + BASE, "1h", LOOKBACK_1H)
+    except Exception as e:
+        print(symbol, "Binance 1H fail:", e)
+        return pd.DataFrame()
 
 def fetch_ohlc_1d(symbol: str) -> pd.DataFrame:
     if symbol == "BGB":
-        return fetch_bitget_bgb("1d", LOOKBACK_1D)
-    else:
+        try:
+            return fetch_bitget_bgb("1d", LOOKBACK_1D)
+        except Exception as e:
+            print("BGB 1d fetch error:", e)
+            return pd.DataFrame()
+    # rotation: OKX → Bybit → Binance
+    try:
+        return fetch_okx(OKX_IDS[symbol], "1D", LOOKBACK_1D)
+    except Exception as e:
+        print(symbol, "OKX 1D fail:", e)
+    try:
+        return fetch_bybit(BYBIT_SYM[symbol], "D", LOOKBACK_1D)
+    except Exception as e:
+        print(symbol, "Bybit 1D fail:", e)
+    try:
         return fetch_binance(symbol + BASE, "1d", LOOKBACK_1D)
+    except Exception as e:
+        print(symbol, "Binance 1D fail:", e)
+        return pd.DataFrame()
 
 # -----------------------
 # Indicators (pure pandas)
@@ -173,38 +253,28 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame | None:
     out["macd_hist"] = h
     return out.dropna().copy()
 
-# 4H from 1H with fallback to 1H if needed
-def resample_to_4h(df1h: pd.DataFrame) -> tuple[pd.DataFrame, str]:
+# 4H from 1H with optional fallback to 1H
+def resample_to_4h(df1h: pd.DataFrame):
     if df1h is None or df1h.empty:
         return None, "no-1h"
-    # 4h resample (use 'h' to avoid pandas future warning)
     ohlc = df1h["close"].resample("4h", label="right", closed="right").ohlc()
     vol = df1h["volume"].resample("4h", label="right", closed="right").sum()
     df4 = pd.concat([ohlc, vol], axis=1)
     df4.columns = ["open","high","low","close","volume"]
     df4 = df4.dropna()
     if len(df4) < 60:
-        # Fallback to 1h if 4h too short
-        print(f"[FALLBACK] 4H insufficiente (len={len(df4)}). Uso 1H per segnali intraday.")
-        return df1h, "1h"
+        if ALLOW_1H_FALLBACK:
+            print(f"[FALLBACK] 4H insufficiente (len={len(df4)}). Uso 1H per segnali intraday.")
+            return df1h, "1h"
+        else:
+            print(f"[SKIP] 4H insufficiente (len={len(df4)}). Nessun fallback: coin ignorata.")
+            return None, "none"
     return df4, "4h"
 
 # -----------------------
 # Signals + reasons
 # -----------------------
 def evaluate_signals(symbol: str, state, nowu: dt.datetime) -> dict:
-    """
-    Returns dict:
-      {
-        'ok': bool,
-        'reason': 'text',
-        'price': last_close,
-        'buy': True/False,
-        'opp': True/False,
-        'trend1d': 'UP/DOWN/FLAT/UNKNOWN',
-        'frameUsed': '4h or 1h'
-      }
-    """
     try:
         df1h = fetch_ohlc_1h(symbol)
         df1d = fetch_ohlc_1d(symbol)
@@ -223,7 +293,6 @@ def evaluate_signals(symbol: str, state, nowu: dt.datetime) -> dict:
     else:
         last = d1.iloc[-1]
         prev = d1.iloc[-2] if len(d1) > 1 else last
-        # simple trend: macd above signal → UP; below → DOWN; else FLAT
         if last["macd"] > last["macd_signal"] and last["macd_hist"] > prev["macd_hist"]:
             trend = "UP"
         elif last["macd"] < last["macd_signal"] and last["macd_hist"] < prev["macd_hist"]:
@@ -232,14 +301,13 @@ def evaluate_signals(symbol: str, state, nowu: dt.datetime) -> dict:
             trend = "FLAT"
 
     # 4H (or fallback 1H) for intraday signals
-    frameUsed = "4h"
     dfX, used = resample_to_4h(df1h)
-    if used == "1h":
-        frameUsed = "1h"
+    if dfX is None or used == "none":
+        return {"ok": False, "reason": f"insufficient-4h-no-fallback"}
 
     x = add_indicators(dfX)
     if x is None or x.empty:
-        return {"ok": False, "reason": f"no-{frameUsed}-indicators"}
+        return {"ok": False, "reason": f"no-{used}-indicators"}
 
     last = x.iloc[-1]
     prev = x.iloc[-2] if len(x) > 1 else last
@@ -257,11 +325,22 @@ def evaluate_signals(symbol: str, state, nowu: dt.datetime) -> dict:
     condOPPcore = (last["rsi"] <= rsiOpp) and (last["macd"] > last["macd_signal"])
     condOPP = condOPPcore or histImproving
 
-    # Trend filter: require 1D not strongly DOWN for BUY; allow OPP even in DOWN if hist improving
-    trendOK = (trend != "DOWN") or condOPP
+    # Trend filter modes
+    if TREND_FILTER == "buy_only_up":
+        if trend != "UP":
+            condBUY = False  # blocca solo i BUY
+    elif TREND_FILTER == "all_up":
+        if trend != "UP":
+            condBUY = False
+            condOPP = False
+
+    # Default soft filter (if off): blocca solo BUY in 1D chiaramente DOWN, lascia OPP se hist migliora
+    trendOK = True
+    if TREND_FILTER == "off":
+        trendOK = (trend != "DOWN") or condOPP
 
     if not trendOK:
-        return {"ok": False, "reason": f"blocked-by-1D-trend({trend})", "price": price, "trend1d": trend, "frameUsed": frameUsed}
+        return {"ok": False, "reason": f"blocked-by-1D-trend({trend})", "price": price, "trend1d": trend, "frameUsed": used}
 
     # Cooldown logic for OPP
     coinKey = f"{symbol}_OPP"
@@ -271,17 +350,14 @@ def evaluate_signals(symbol: str, state, nowu: dt.datetime) -> dict:
     buy = condBUY
     opp = False
     if ENABLE_OPP:
-        # only send OPP if not in cooldown
         opp = (condOPP and not buy and not cooldown_active)
 
     if buy:
-        return {"ok": True, "reason": "BUY", "price": price, "buy": True, "opp": False, "trend1d": trend, "frameUsed": frameUsed}
+        return {"ok": True, "reason": "BUY", "price": price, "buy": True, "opp": False, "trend1d": trend, "frameUsed": used}
     if opp:
-        # set cooldown
         state["cooldowns"][coinKey] = (nowu + timedelta(hours=OPP_COOLDOWN_H)).timestamp()
-        return {"ok": True, "reason": "OPPORTUNITY", "price": price, "buy": False, "opp": True, "trend1d": trend, "frameUsed": frameUsed}
+        return {"ok": True, "reason": "OPPORTUNITY", "price": price, "buy": False, "opp": True, "trend1d": trend, "frameUsed": used}
 
-    # No signal: provide reason
     details = []
     if last["rsi"] > rsiOpp:
         details.append(f"RSI>{rsiOpp:.0f}")
@@ -290,7 +366,7 @@ def evaluate_signals(symbol: str, state, nowu: dt.datetime) -> dict:
     if not histImproving and not crossUp:
         details.append("hist not improving")
 
-    return {"ok": False, "reason": "no-signal(" + ", ".join(details) + ")", "price": price, "trend1d": trend, "frameUsed": frameUsed}
+    return {"ok": False, "reason": "no-signal(" + ", ".join(details) + ")", "price": price, "trend1d": trend, "frameUsed": used}
 
 # -----------------------
 # Daily + Heartbeat
@@ -308,20 +384,24 @@ def build_daily_table():
     lines.append("SYMB   1D Δ%   MACDΔ%   TREND")
     lines.append("-----  ------  -------  ------")
     for c in COINS:
-        d1 = fetch_ohlc_1d(c)
-        if d1 is None or d1.empty or len(d1) < 2:
+        try:
+            d1 = fetch_ohlc_1d(c)
+            if d1 is None or d1.empty or len(d1) < 2:
+                lines.append(f"{c:5}    n/a     n/a    n/a")
+                continue
+            d1i = add_indicators(d1)
+            if d1i is None or d1i.empty:
+                lines.append(f"{c:5}    n/a     n/a    n/a")
+                continue
+            last = d1i.iloc[-1]
+            prev = d1i.iloc[-2]
+            pchg = pct(last["close"], prev["close"])
+            macddelta = (last["macd"] - last["macd_signal"]) - (prev["macd"] - prev["macd_signal"])
+            t = "UP" if last["macd"] >= last["macd_signal"] else "DOWN"
+            lines.append(f"{c:5} {pchg:7.2f}% {macddelta:8.3f}  {t:>5}")
+        except Exception as e:
+            print(f"[DAILY] {c} build err:", e)
             lines.append(f"{c:5}    n/a     n/a    n/a")
-            continue
-        d1i = add_indicators(d1)
-        if d1i is None or d1i.empty:
-            lines.append(f"{c:5}    n/a     n/a    n/a")
-            continue
-        last = d1i.iloc[-1]
-        prev = d1i.iloc[-2]
-        pchg = pct(last["close"], prev["close"])
-        macddelta = (last["macd"] - last["macd_signal"]) - (prev["macd"] - prev["macd_signal"])
-        t = "UP" if last["macd"] >= last["macd_signal"] else "DOWN"
-        lines.append(f"{c:5} {pchg:7.2f}% {macddelta:8.3f}  {t:>5}")
     return "<pre>" + "\n".join(lines) + "</pre>"
 
 # -----------------------
@@ -340,7 +420,7 @@ def news_allowed_for(symbol: str, state, nowu: dt.datetime, move_pct_24h: float)
 
 def mark_news_cooldown(symbol: str, state, nowu: dt.datetime):
     key = f"{symbol}_NEWS"
-    state["newsCooldowns"][key] = (nowu + timedelta(hours=NEWS_COOLDOWN_H)).timestamp()
+    state.setdefault("newsCooldowns", {})[key] = (nowu + timedelta(hours=NEWS_COOLDOWN_H)).timestamp()
 
 def try_send_news(symbol: str, move_pct_24h: float, state, nowu: dt.datetime):
     if not news_allowed_for(symbol, state, nowu, move_pct_24h):
@@ -380,7 +460,6 @@ def run_once():
     print(f"[SYNC] Start: {nowu.strftime('%Y-%m-%d %H:%M:%S')} UTC | Local: {nowu.astimezone().strftime('%Y-%m-%d %H:%M:%S %Z')} | last_daily={state.get('last_daily','')} | last_heartbeat={state.get('last_heartbeat','')}")
 
     # Signals
-    summary = []
     had_buy = False
     had_opp = False
     for c in COINS:
@@ -390,56 +469,46 @@ def run_once():
             print(f"{c} no-alert: {reason}")
             continue
         price = res["price"]
-        trend = res["trend1d"]
-        frame = res["frameUsed"]
+        trend = res.get("trend1d","UNKNOWN")
+        frame = res.get("frameUsed","?")
         if res.get("buy", False):
             had_buy = True
             msg = f"🟢 <b>BUY</b> {c}/{BASE} ({frame}, 1D {trend})\nPrezzo: {price:.4f}"
             send_telegram(msg)
-            summary.append(f"{c}: BUY")
         elif res.get("opp", False):
             had_opp = True
             msg = f"🟡 <b>OPPORTUNITY</b> {c}/{BASE} ({frame}, 1D {trend})\nPrezzo: {price:.4f}"
             send_telegram(msg)
-            summary.append(f"{c}: OPP")
 
     if not had_buy and not had_opp:
         print("Nessun BUY/OPP valido (filtrato da trend 1D / cooldown / condizioni tecniche).")
 
-    # Daily & heartbeat
+    # Daily & heartbeat (safe)
     try:
-        will_daily = should_send_daily_report(state)
-        will_heart = should_send_heartbeat(state)
+        if should_send_daily_report(state):
+            report = build_daily_table()
+            send_telegram("🗞️ <b>Daily Trend 1D</b>\n" + report)
+            state["last_daily"] = nowu.date().isoformat()
+        if should_send_heartbeat(state):
+            send_telegram("✅ Heartbeat: bot attivo e sincronizzato")
+            state["last_heartbeat"] = nowu.date().isoformat()
     except Exception as e:
-        print(f"[SYNC] log error: {e}")
-        will_daily = False
-        will_heart = False
+        print(f"[DAILY/HB] error: {e}")
 
-    if will_daily:
-        report = build_daily_table()
-        send_telegram("🗞️ <b>Daily Trend 1D</b>\n" + report)
-        state["last_daily"] = nowu.date().isoformat()
-
-    if will_heart:
-        send_telegram("✅ Heartbeat: bot attivo e sincronizzato")
-        state["last_heartbeat"] = nowu.date().isoformat()
-
-    # News intraday (Δ24h)
+    # News intraday – safe per provider errors
     for c in COINS:
-        d1 = fetch_ohlc_1d(c)
-        if d1 is None or len(d1) < 2:
-            continue
-        last = d1.iloc[-1]["close"]
-        prev = d1.iloc[-2]["close"]
-        move = pct(last, prev)
-        try_send_news(c, move, state, nowu)
+        try:
+            d1 = fetch_ohlc_1d(c)
+            if d1 is None or len(d1) < 2:
+                continue
+            last = d1.iloc[-1]["close"]
+            prev = d1.iloc[-2]["close"]
+            move = pct(last, prev)
+            try_send_news(c, move, state, nowu)
+        except Exception as e:
+            print(f"[NEWS LOOP] {c} fetch err: {e}")
 
     save_state(state)
 
 if __name__ == "__main__":
-    try:
-        run_once()
-    except Exception as e:
-        print(f"[FATAL] {e}")
-        # keep non-zero exit to surface on Actions
-        raise
+    run_once()

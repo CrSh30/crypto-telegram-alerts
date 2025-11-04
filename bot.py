@@ -155,25 +155,53 @@ def fetch_binance(symbol: str, interval: str, limit: int) -> pd.DataFrame:
 
 # Bitget (BGB only) – v2 requires granularity "1h" or "1day"
 def fetch_bitget_bgb(interval: str, limit: int) -> pd.DataFrame:
-    gran = {"1h":"1h", "1d":"1day"}[interval]  # FIX: use 1day for daily
-    url = "https://api.bitget.com/api/v2/spot/market/history-candles"
-    params = {"symbol":"BGBUSDT", "granularity": gran, "limit": str(min(limit, 400))}
-    r = requests.get(url, params=params, timeout=20)
-    r.raise_for_status()
-    j = r.json()
-    if j.get("code") != "00000" or "data" not in j:
-        print(f"[BGB] Bitget unexpected payload: {j}")
-        return pd.DataFrame()
-    rows = j["data"][::-1]
-    if not rows:
-        return pd.DataFrame()
-    recs = []
-    for row in rows:
-        ts, o, h, l, c, v = row
-        t = pd.to_datetime(int(ts), unit="ms", utc=True)
-        recs.append([t, float(o), float(h), float(l), float(c), float(v)])
-    df = pd.DataFrame(recs, columns=["time","open","high","low","close","volume"]).set_index("time")
-    return df
+    # Bitget v2 wants granularity as: 1min, 5min, 15min, 30min, 1hour, 4hour, 1day, 1week, 1month
+    gran_map = {"1h": "1hour", "1d": "1day"}
+    gran = gran_map[interval]
+    lim = min(max(int(limit), 1), 200)  # v2 spesso accetta max 200
+
+    # Proviamo prima l'endpoint "candles" (più permissivo), poi "history-candles" con endTime
+    attempts = [
+        ("https://api.bitget.com/api/v2/spot/market/candles",
+         {"symbol": "BGBUSDT", "granularity": gran, "limit": str(lim)}),
+
+        ("https://api.bitget.com/api/v2/spot/market/history-candles",
+         {"symbol": "BGBUSDT", "granularity": gran, "limit": str(lim),
+          "endTime": str(int(dt.datetime.now(timezone.utc).timestamp() * 1000))}),
+    ]
+
+    last_err = None
+    for url, params in attempts:
+        try:
+            r = requests.get(url, params=params, timeout=20)
+            r.raise_for_status()
+            j = r.json()
+            if j.get("code") != "00000" or "data" not in j or not j["data"]:
+                last_err = f"[BGB] Bitget unexpected payload: {j}"
+                print(last_err)
+                continue
+
+            # v2 restituisce dal più recente al meno recente: [ts, o, h, l, c, v]
+            rows = j["data"][::-1]
+            recs = []
+            for row in rows:
+                ts, o, h, l, c, v = row
+                t = pd.to_datetime(int(ts), unit="ms", utc=True)
+                recs.append([t, float(o), float(h), float(l), float(c), float(v)])
+            df = pd.DataFrame(recs, columns=["time","open","high","low","close","volume"]).set_index("time")
+            if not df.empty:
+                return df
+        except requests.HTTPError as he:
+            # log dettagliato e tenta l'altro endpoint
+            print(f"[BGB] Bitget fetch fail ({url}): {he.response.status_code} {he.response.text[:200]}")
+            last_err = str(he)
+        except Exception as e:
+            print(f"[BGB] Bitget fetch error ({url}): {e}")
+            last_err = str(e)
+
+    # Se siamo qui, non abbiamo dati validi
+    print(last_err or "[BGB] Bitget: no data")
+    return pd.DataFrame()
 
 # ---- Unified fetchers with rotation ----
 def fetch_ohlc_1h(symbol: str) -> pd.DataFrame:
